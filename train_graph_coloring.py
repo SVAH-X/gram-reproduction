@@ -1,30 +1,43 @@
-"""GRAM Graph 3-Coloring training (paper-scale).
+"""Paper-aligned GRAM training for Graph Coloring.
 
-Same model + optimizer + EMA + LPRM + halt machinery as train_paper.py
-(N-Queens). The differences are all on the data side:
-    - vocab_size = 6 (no-edge / edge / 3 colors / mask)
-    - seq_len    = N*N + N  (adjacency concatenated to coloring)
-    - y_mask     = True only at the N color positions
-    - eval metric = conflict edges (paper: 2.7 for N=8, 3.3 for N=10)
+This script follows Appendix C.2.2 as closely as possible:
+  * n in {8, 10}, 3 colors.
+  * Input is the strict upper triangle of the adjacency matrix.
+  * Output is the length-n node-color sequence.
+  * Valid 3-colorings are enumerated and canonicalized to remove color
+    permutation duplicates.
+  * Paper train/test graph counts are used by default.
+  * Paper epochs are treated as trajectory batches; each trajectory performs
+    N_sup segment-level gradient updates.
 
-Defaults for β: paper Table — 0.5 for N=8, 0.45 for N=10.
-
-Usage:
-    python train_graph_coloring.py --n 8
-    python train_graph_coloring.py --n 10
-    python train_graph_coloring.py --n 8 --b-per-step 128 --accum 6
+The paper says graphs are Erdos-Renyi with a fixed edge probability but does
+not state that probability. The default remains p=0.4 because this project
+already used that value; pass --p-edge if you want to sweep it.
 """
+
+from __future__ import annotations
+
 import argparse
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 
-from gram_model import GRAM, GRAMConfig, EMA
+from gram_model import EMA, GRAM, GRAMConfig
 from data_graph_coloring import (
-    GraphColoringBatcher, conflict_edges,
-    VOCAB_SIZE, COLOR_BASE, NUM_COLORS, MASK,
+    VOCAB_SIZE,
+    GraphColoringEvalSet,
+    GraphColoringTrainDataset,
+    build_graph_coloring,
+    color_logits_to_tokens,
+    conflict_edges,
+    default_split_sizes,
+    graph_coverage,
+    load_graph_coloring_cache,
+    steps_per_epoch,
 )
 
 
@@ -33,214 +46,293 @@ def _nullcontext():
     yield
 
 
-@torch.no_grad()
-def _color_accuracy(pred_full, y_full, n):
-    """Token accuracy on color positions only. pred_full / y_full: (B, n²+n)."""
-    pred_c = pred_full[:, n * n:]
-    y_c    = y_full[:, n * n:]
-    correct = (pred_c == y_c)
-    full_tok   = correct.float().mean().item()
-    full_board = correct.all(dim=1).float().mean().item()
-    return full_tok, full_board
+def paper_beta(n: int) -> float:
+    if n == 8:
+        return 0.5
+    if n == 10:
+        return 0.45
+    raise ValueError("The paper specifies Graph Coloring only for n=8 and n=10.")
 
 
 @torch.no_grad()
-def evaluate(model, batcher, batch_size, device, N_best=20,
-             use_ema=False, ema=None):
+def evaluate(model, eval_set, batch_size, device, samples=20, max_examples=None, use_ema=False, ema=None):
     model.eval()
-    n = batcher.n
-    x, y, _, adj = batcher.sample(batch_size)
-    x, y, adj = x.to(device), y.to(device), adj.to(device)
-
     ctx = ema.swap_in(model) if use_ema else _nullcontext()
+    total = 0
+    conflict_sum = 0.0
+    coverage_sum = 0.0
     with ctx:
-        # best-of-1
-        logits1 = model(x)
-        pred1 = logits1.argmax(-1)
-        ft1, fb1 = _color_accuracy(pred1, y, n)
-        col1 = (pred1[:, n * n:] - COLOR_BASE).clamp(0, NUM_COLORS - 1)
-        ce1 = conflict_edges(col1, adj).mean().item()
+        for x, adj, colorings in eval_set.batches(batch_size, max_examples=max_examples):
+            x = x.to(device)
+            adj = adj.to(device)
+            logits = model(x)
+            pred_colors = color_logits_to_tokens(logits, eval_set.n)
+            bsz = x.shape[0]
+            conflict_sum += conflict_edges(pred_colors, adj).sum().item()
 
-        # best-of-N
-        logitsN, scores = model.forward_best_of_n(x, N=N_best)
-        predN = logitsN.argmax(-1)
-        ftN, fbN = _color_accuracy(predN, y, n)
-        colN = (predN[:, n * n:] - COLOR_BASE).clamp(0, NUM_COLORS - 1)
-        ceN = conflict_edges(colN, adj).mean().item()
-
-        if model.cfg.use_halt:
-            logitsH, n_steps_h = model.forward_with_halt(x)
-            predH = logitsH.argmax(-1)
-            ftH, fbH = _color_accuracy(predH, y, n)
-            colH = (predH[:, n * n:] - COLOR_BASE).clamp(0, NUM_COLORS - 1)
-            ceH = conflict_edges(colH, adj).mean().item()
-            avg_steps = n_steps_h.float().mean().item()
-        else:
-            ftH = fbH = ceH = avg_steps = float("nan")
-
-    return dict(
-        n1_full_tok=ft1, n1_full_color=fb1, n1_conflicts=ce1,
-        nN_full_tok=ftN, nN_full_color=fbN, nN_conflicts=ceN,
-        halt_full_tok=ftH, halt_full_color=fbH, halt_conflicts=ceH,
-        halt_avg_steps=avg_steps, score_mean=scores.mean().item(),
-    )
+            preds = []
+            for _ in range(samples):
+                logits_s = model(x)
+                preds.append(color_logits_to_tokens(logits_s, eval_set.n).cpu())
+            sample_tensor = torch.stack(preds, dim=1)
+            coverage_sum += graph_coverage(sample_tensor, colorings, eval_set.n) * bsz
+            total += bsz
+    return {
+        "conflicts": conflict_sum / max(total, 1),
+        "coverage": coverage_sum / max(total, 1),
+        "n_eval": total,
+    }
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n",          type=int, default=8,
-                    help="number of nodes (paper: 8 or 10)")
-    ap.add_argument("--p-edge",     type=float, default=0.4,
-                    help="Erdős-Rényi edge probability")
-    ap.add_argument("--cache-size", type=int, default=4096,
-                    help="number of pre-cached 3-colorable graphs")
+    ap.add_argument("--n", type=int, default=8, choices=[8, 10])
+    ap.add_argument("--epochs", type=int, default=5000)
+    ap.add_argument("--max-steps", type=int, default=None, help="Optional debug cap; overrides full epoch count.")
+    ap.add_argument("--global-batch", type=int, default=768)
     ap.add_argument("--b-per-step", type=int, default=64)
-    ap.add_argument("--accum",      type=int, default=12)
-    ap.add_argument("--steps",      type=int, default=30_000)
-    ap.add_argument("--warmup",     type=int, default=1_000)
-    ap.add_argument("--lr",         type=float, default=1e-4)         # ✓ paper
-    ap.add_argument("--wd",         type=float, default=1.0)          # ✓ paper
-    ap.add_argument("--beta",       type=float, default=None,
-                    help="KL weight; defaults: 0.5 (n=8), 0.45 (n=10)")
-    ap.add_argument("--kl-balance", type=float, default=0.8)          # ✓ paper
-    ap.add_argument("--ema-decay",  type=float, default=0.9999)       # ✓ paper
-    ap.add_argument("--halt-weight",type=float, default=0.5)          # ⚠ guess
-    ap.add_argument("--lprm-weight",type=float, default=1.0)          # ⚠ guess
-    ap.add_argument("--log-every",  type=int, default=200)
-    ap.add_argument("--eval-every", type=int, default=2_000)
-    ap.add_argument("--ckpt-every", type=int, default=5_000)
+    ap.add_argument("--p-edge", type=float, default=0.4)
+    ap.add_argument("--train-size", type=int, default=None, help="Paper default: 7002 for n=8, 13465 for n=10.")
+    ap.add_argument("--test-size", type=int, default=None, help="Paper default: 255 for n=8, 192 for n=10.")
+    ap.add_argument("--data-cache", type=str, default=None, help="Explicit prepare_data.py cache file. Defaults to data_cache/graphcolor_n{n}_p{p}_seed{seed}.pt when present.")
+    ap.add_argument("--cache-dir", type=str, default=None, help="Optional generator cache for custom sweeps; default is disabled.")
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--wd", type=float, default=1.0)
+    ap.add_argument("--beta", type=float, default=None)
+    ap.add_argument("--kl-balance", type=float, default=0.8)
+    ap.add_argument("--ema-decay", type=float, default=0.9999)
+    ap.add_argument("--halt-weight", type=float, default=1.0)
+    ap.add_argument("--lprm-weight", type=float, default=1.0)
+    ap.add_argument("--warmup-steps", type=int, default=0, help="Paper does not specify warmup; default is none.")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", type=str, default=None)
+    ap.add_argument("--num-workers", type=int, default=0)
+    ap.add_argument("--log-every", type=int, default=5)
+    ap.add_argument("--eval-every", type=int, default=1000)
+    ap.add_argument("--eval-batch", type=int, default=128)
+    ap.add_argument("--eval-max", type=int, default=512, help="Use 0 for full test set during periodic eval.")
+    ap.add_argument("--coverage-samples", type=int, default=20)
+    ap.add_argument("--ckpt-every", type=int, default=5000)
     ap.add_argument("--out-prefix", type=str, default=None)
-    ap.add_argument("--seed",       type=int, default=0)
-    ap.add_argument("--device",     type=str, default=None)
+    ap.add_argument("--no-amp", action="store_true")
     args = ap.parse_args()
 
-    PAPER_BETA = {8: 0.5, 10: 0.45}
+    if args.global_batch % args.b_per_step != 0:
+        raise ValueError("--global-batch must be divisible by --b-per-step.")
     if args.beta is None:
-        if args.n not in PAPER_BETA:
-            raise ValueError(f"--n={args.n}: paper specifies n=8 (β=0.5) and "
-                             f"n=10 (β=0.45). Pass --beta explicitly otherwise.")
-        args.beta = PAPER_BETA[args.n]
-    if args.out_prefix is None:
-        args.out_prefix = f"gram_graphcolor_n{args.n}"
+        args.beta = paper_beta(args.n)
+    default_train, default_test = default_split_sizes(args.n)
+    train_size = args.train_size or default_train
+    test_size = args.test_size or default_test
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}")
-    if device == "cuda":
-        print(f"gpu  : {torch.cuda.get_device_name(0)}")
     torch.manual_seed(args.seed)
+    use_amp = (device == "cuda") and (not args.no_amp) and torch.cuda.is_bf16_supported()
+    amp_ctx = (lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)) if use_amp else _nullcontext
 
-    n = args.n
-    seq_len = n * n + n
+    default_cache = Path("data_cache") / f"graphcolor_n{args.n}_p{args.p_edge:g}_seed{args.seed}.pt"
+    use_default_cache = args.train_size is None and args.test_size is None and default_cache.exists()
+    if args.data_cache or use_default_cache:
+        data_cache = Path(args.data_cache) if args.data_cache else default_cache
+        build = load_graph_coloring_cache(data_cache)
+        if build.n != args.n:
+            raise ValueError(f"Cache {data_cache} is for n={build.n}, but --n={args.n}.")
+        args.p_edge = build.p_edge
+        data_source = str(data_cache)
+    else:
+        build = build_graph_coloring(
+            args.n,
+            p_edge=args.p_edge,
+            train_size=train_size,
+            test_size=test_size,
+            seed=args.seed,
+            cache_dir=args.cache_dir,
+        )
+        data_source = "generated in memory"
+
+    train_ds = GraphColoringTrainDataset(build, seed=args.seed)
+    test_eval = GraphColoringEvalSet(build, split="test")
+    dataset_batches_per_pass = steps_per_epoch(len(train_ds), args.global_batch)
+    seq_len = args.n * (args.n - 1) // 2
+    target_seq_len = args.n
 
     cfg = GRAMConfig(
-        vocab_size=VOCAB_SIZE, seq_len=seq_len,
-        d_model=512, n_heads=8, ffn_hidden=512, n_layers=2,
-        K=4, T=3, N_sup=16,
-        use_attn=True, use_rope=True, use_halt=True,
+        vocab_size=VOCAB_SIZE,
+        seq_len=seq_len,
+        target_seq_len=target_seq_len,
+        d_model=512,
+        n_heads=8,
+        ffn_hidden=512,
+        n_layers=2,
+        K=4,
+        T=3,
+        N_sup=16,
+        use_attn=True,
+        use_rope=True,
+        use_halt=True,
     )
     model = GRAM(cfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"task             : Graph 3-Coloring N={n} (seq_len {seq_len}, β {args.beta})")
-    print(f"params           : {n_params/1e6:.2f}M")
-    print(f"transitions/step : N_sup * T = {cfg.N_sup * cfg.T}")
-
     ema = EMA(model, decay=args.ema_decay)
-    opt = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd,
-                betas=(0.9, 0.95))
+    opt = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    planned_steps = args.epochs * cfg.N_sup
+    total_steps = min(planned_steps, args.max_steps) if args.max_steps else planned_steps
 
-    print(f"caching {args.cache_size} 3-colorable graphs (n={n}, p_edge={args.p_edge}) ...")
-    batcher = GraphColoringBatcher(n=n, p_edge=args.p_edge,
-                                   cache_size=args.cache_size, seed=args.seed)
-    print(f"cached {batcher.num_graphs()} graphs")
+    out_prefix = args.out_prefix or f"gram_graphcolor_n{args.n}"
+    print(f"device           : {device}")
+    print(f"amp              : {'bf16' if use_amp else 'off'}")
+    print(f"task             : Graph Coloring n={args.n}")
+    print(f"data source      : {data_source}")
+    print(f"params           : {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    print(f"input seq_len    : {seq_len} strict-upper-triangle tokens")
+    print(f"target seq_len   : {target_seq_len} node-color tokens")
+    print(f"edge probability : {args.p_edge} (paper does not state this value)")
+    print(f"train/test graphs: {len(build.train_graphs)} / {len(build.test_graphs)}")
+    print(f"global batch     : {args.global_batch} ({args.b_per_step} microbatch)")
+    print(f"dataset batches/pass      : {dataset_batches_per_pass}")
+    print(f"paper trajectory batches  : {args.epochs}")
+    print(f"segment updates/trajectory: {cfg.N_sup}")
+    print(f"planned training steps    : {planned_steps}")
+    print(f"running training steps    : {total_steps}")
+    print(f"beta             : {args.beta}")
 
-    target_batch = args.b_per_step * args.accum
-    print(f"effective batch  : {args.b_per_step} * {args.accum} = {target_batch} "
-          f"(paper: 768){'  ✓' if target_batch == 768 else '  ⚠ paper used 768'}")
-
-    def lr_at(step):
-        if step < args.warmup:
-            return step / max(1, args.warmup)
-        return 1.0
-
-    # -------------------------------------------------------------- training
-    log = []
-    t0 = time.time()
-    log_path = f"{args.out_prefix}.log"
+    loader_gen = torch.Generator().manual_seed(args.seed)
+    log_path = f"{out_prefix}.log"
     logf = open(log_path, "w")
+    t0 = time.time()
+    global_step = 0
 
-    for step in range(1, args.steps + 1):
-        for g in opt.param_groups:
-            g["lr"] = args.lr * lr_at(step)
+    def lr_scale(step: int) -> float:
+        if args.warmup_steps <= 0:
+            return 1.0
+        return min(1.0, step / max(args.warmup_steps, 1))
 
-        opt.zero_grad(set_to_none=True)
-        info_accum = {"loss": 0.0, "recon": 0.0, "kl": 0.0,
-                      "lprm": 0.0, "halt": 0.0, "r": 0.0, "acc": 0.0}
-        for _ in range(args.accum):
-            x, y, y_mask, _ = batcher.sample(args.b_per_step)
-            x, y, y_mask = x.to(device), y.to(device), y_mask.to(device)
-            model.train()
-            loss, info = model.train_step(
-                x, y,
-                beta=args.beta, kl_balance=args.kl_balance,
-                lprm_weight=args.lprm_weight, halt_weight=args.halt_weight,
-                y_mask=y_mask,
-            )
-            (loss / args.accum).backward()
-            for k in info_accum:
-                info_accum[k] += info[k] / args.accum
+    try:
+        loader = DataLoader(
+            train_ds,
+            batch_size=args.global_batch,
+            shuffle=True,
+            drop_last=False,
+            num_workers=args.num_workers,
+            generator=loader_gen,
+        )
+        loader_iter = iter(loader)
+        trajectory = 0
+        while trajectory < args.epochs and global_step < total_steps:
+            try:
+                x_global, y_global = next(loader_iter)
+            except StopIteration:
+                loader_iter = iter(loader)
+                x_global, y_global = next(loader_iter)
+            trajectory += 1
+            x_global = x_global.to(device)
+            y_global = y_global.to(device)
+            batch_actual = x_global.shape[0]
+            states = [None] * ((batch_actual + args.b_per_step - 1) // args.b_per_step)
 
-        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        ema.update(model)
+            for segment in range(1, cfg.N_sup + 1):
+                if global_step >= total_steps:
+                    break
+                global_step += 1
+                for group in opt.param_groups:
+                    group["lr"] = args.lr * lr_scale(global_step)
+                opt.zero_grad(set_to_none=True)
+                info_accum = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "lprm": 0.0, "halt": 0.0, "r": 0.0, "acc": 0.0}
+                next_states = []
 
-        if step == 1 or step % args.log_every == 0:
-            msg = (f"step {step:6d} | loss {info_accum['loss']:.4f} | "
-                   f"recon {info_accum['recon']:.4f} | kl {info_accum['kl']:.4f} | "
-                   f"halt {info_accum['halt']:.4f} | lprm {info_accum['lprm']:.4f} | "
-                   f"r {info_accum['r']:.3f} | acc {info_accum['acc']:.3f} | "
-                   f"gn {gn.item():.2f} | t {time.time()-t0:.1f}s")
-            print(msg); logf.write(msg + "\n"); logf.flush()
-            log.append(dict(step=step, **info_accum, gnorm=gn.item(), t=time.time()-t0))
+                for mi, start in enumerate(range(0, batch_actual, args.b_per_step)):
+                    end = min(start + args.b_per_step, batch_actual)
+                    weight = (end - start) / batch_actual
+                    x = x_global[start:end]
+                    y = y_global[start:end]
+                    h, l = states[mi] if states[mi] is not None else (None, None)
+                    model.train()
+                    with amp_ctx():
+                        loss, info, h_next, l_next = model.train_supervision_segment(
+                            x,
+                            y,
+                            h=h,
+                            l=l,
+                            beta=args.beta,
+                            kl_balance=args.kl_balance,
+                            lprm_weight=args.lprm_weight,
+                            halt_weight=args.halt_weight,
+                        )
+                    (loss * weight).backward()
+                    next_states.append((h_next, l_next))
+                    for key in info_accum:
+                        info_accum[key] += info[key] * weight
+                states = next_states
 
-        if step % args.eval_every == 0:
-            ev_raw = evaluate(model, batcher, 128, device, N_best=20, use_ema=False)
-            ev_ema = evaluate(model, batcher, 128, device, N_best=20, use_ema=True, ema=ema)
-            for tag, ev in (("raw", ev_raw), ("EMA", ev_ema)):
-                lines = [
-                    f"  >> {tag:3s}  N=1   tok {ev['n1_full_tok']:.3f} "
-                    f"full {ev['n1_full_color']:.3f} conflicts {ev['n1_conflicts']:.2f}",
-                    f"  >> {tag:3s}  N=20  tok {ev['nN_full_tok']:.3f} "
-                    f"full {ev['nN_full_color']:.3f} conflicts {ev['nN_conflicts']:.2f}",
-                    f"  >> {tag:3s}  halt  tok {ev['halt_full_tok']:.3f} "
-                    f"full {ev['halt_full_color']:.3f} conflicts {ev['halt_conflicts']:.2f} "
-                    f"avg_steps {ev['halt_avg_steps']:.2f}",
-                ]
-                for line in lines:
-                    print(line); logf.write(line + "\n")
-            logf.flush()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                ema.update(model)
 
-        if step % args.ckpt_every == 0:
-            ckpt_path = f"{args.out_prefix}_step{step}.pt"
-            torch.save({
+                if global_step == 1 or global_step % args.log_every == 0:
+                    msg = (
+                        f"traj {trajectory:5d}/{args.epochs} seg {segment:2d}/{cfg.N_sup} "
+                        f"step {global_step:7d}/{total_steps} | "
+                        f"loss {info_accum['loss']:.4f} recon {info_accum['recon']:.4f} "
+                        f"kl {info_accum['kl']:.4f} halt {info_accum['halt']:.4f} "
+                        f"lprm {info_accum['lprm']:.4f} r {info_accum['r']:.3f} "
+                        f"acc {info_accum['acc']:.3f} gn {grad_norm.item():.2f} "
+                        f"t {time.time() - t0:.1f}s"
+                    )
+                    print(msg)
+                    logf.write(msg + "\n")
+                    logf.flush()
+
+                if args.eval_every and global_step % args.eval_every == 0:
+                    eval_max = None if args.eval_max == 0 else args.eval_max
+                    for tag, use_ema in (("raw", False), ("EMA", True)):
+                        ev = evaluate(
+                            model,
+                            test_eval,
+                            args.eval_batch,
+                            device,
+                            samples=args.coverage_samples,
+                            max_examples=eval_max,
+                            use_ema=use_ema,
+                            ema=ema,
+                        )
+                        line = (
+                            f"  >> {tag:3s} test n={ev['n_eval']} "
+                            f"conflicts {ev['conflicts']:.4f} coverage@{args.coverage_samples} {ev['coverage']:.4f}"
+                        )
+                        print(line)
+                        logf.write(line + "\n")
+                    logf.flush()
+
+                if args.ckpt_every and global_step % args.ckpt_every == 0:
+                    path = f"{out_prefix}_step{global_step}.pt"
+                    torch.save(
+                        {
+                            "cfg": cfg.__dict__,
+                            "model": model.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": opt.state_dict(),
+                            "step": global_step,
+                            "trajectory": trajectory,
+                            "segment": segment,
+                            "args": vars(args),
+                        },
+                        path,
+                    )
+                    print(f"  >> ckpt saved: {path}")
+    finally:
+        final_path = f"{out_prefix}_final.pt"
+        torch.save(
+            {
                 "cfg": cfg.__dict__,
                 "model": model.state_dict(),
                 "ema": ema.state_dict(),
                 "opt": opt.state_dict(),
-                "step": step,
+                "step": global_step,
                 "args": vars(args),
-            }, ckpt_path)
-            print(f"  >> ckpt saved: {ckpt_path}")
-
-    final_path = f"{args.out_prefix}_final.pt"
-    torch.save({
-        "cfg": cfg.__dict__,
-        "model": model.state_dict(),
-        "ema":   ema.state_dict(),
-        "log":   log,
-        "args":  vars(args),
-    }, final_path)
-    print(f"done — saved {final_path}")
-    logf.close()
+            },
+            final_path,
+        )
+        logf.close()
+        print(f"done - saved {final_path}")
 
 
 if __name__ == "__main__":

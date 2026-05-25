@@ -4,3 +4,8 @@ __pycache__/
 *.log
 .ipynb_checkpoints/
 .DS_Store
+# Reference PDFs (large; copyrighted; reproducible from arXiv)
+*.pdf
+# Materialized dataset cache (reproducible via prepare_data.py)
+data_cache/*.pt
+data_cache/analysis/figs/

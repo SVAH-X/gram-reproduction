@@ -1,227 +1,318 @@
-"""GRAM Phase 3b — paper-scale N-Queens 8x8 training (Python script form).
+"""Paper-aligned GRAM training for N-Queens.
 
-This is the .py equivalent of `gram_paper.ipynb`. Same config, same loss,
-same eval, same logging. Use whichever you prefer — both produce the same
-checkpoints and the same metrics.
-
-Usage on a GPU server:
-    pip install -r requirements.txt
-    python train_paper.py                                 # default 30k steps
-    python train_paper.py --steps 50000 --b-per-step 128  # 4090/A100 with more VRAM
-
-All hyperparameters (architectural + optimizer) match the GRAM paper for
-N-Queens 8x8. See README.md for the paper-vs-this-repo confidence table.
+This script uses the N-Queens task definition from Appendix C.2.1 of
+"Generative Recursive Reasoning":
+  * N=8 removes k in {5,6,7} queens; N=10 removes k in {7,8,9}.
+  * Train/test split is by unique partial input.
+  * Paper epochs are treated as trajectory batches; each trajectory performs
+    N_sup segment-level gradient updates.
+  * Evaluation reports constraint-satisfaction accuracy and 20-sample coverage.
 """
+
+from __future__ import annotations
+
 import argparse
-import os
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import torch
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 
-from gram_model import GRAM, GRAMConfig, EMA
-from data_nqueens import NQueensBatcher
+from gram_model import EMA, GRAM, GRAMConfig
+from data_nqueens import (
+    VOCAB_SIZE,
+    NQueensEvalSet,
+    NQueensTrainDataset,
+    build_nqueens,
+    load_nqueens_cache,
+    nqueens_accuracy,
+    nqueens_coverage,
+    steps_per_epoch,
+)
 
-
-# ----------------------------------------------------------------- helpers
 
 @contextmanager
 def _nullcontext():
     yield
 
 
-@torch.no_grad()
-def _accuracy(pred, y, x, mask_token):
-    mask_pos = (x == mask_token)
-    correct  = (pred == y)
-    full_tok   = correct.float().mean().item()
-    mask_tok   = ((correct & mask_pos).float().sum().item()
-                  / max(mask_pos.sum().item(), 1))
-    full_board = correct.all(dim=1).float().mean().item()
-    return full_tok, mask_tok, full_board
+def paper_epochs(n: int) -> int:
+    if n == 8:
+        return 3000
+    if n == 10:
+        return 1000
+    raise ValueError("The paper specifies N-Queens only for n=8 and n=10.")
+
+
+def paper_beta(n: int) -> float:
+    if n == 8:
+        return 0.07
+    if n == 10:
+        return 0.045
+    raise ValueError("The paper specifies N-Queens only for n=8 and n=10.")
 
 
 @torch.no_grad()
-def evaluate(model, batcher, batch_size, device, N_best=20, use_ema=False, ema=None):
+def evaluate(model, eval_set, batch_size, device, samples=20, max_examples=None, use_ema=False, ema=None):
     model.eval()
-    x, y = batcher.sample(batch_size)
-    x, y = x.to(device), y.to(device)
-
     ctx = ema.swap_in(model) if use_ema else _nullcontext()
+    total = 0
+    acc_sum = 0.0
+    cov_sum = 0.0
     with ctx:
-        logits1 = model(x)
-        ft1, mt1, fb1 = _accuracy(logits1.argmax(-1), y, x, batcher.MASK)
-        logitsN, scores = model.forward_best_of_n(x, N=N_best)
-        ftN, mtN, fbN = _accuracy(logitsN.argmax(-1), y, x, batcher.MASK)
-        if model.cfg.use_halt:
-            logitsH, n_steps_h = model.forward_with_halt(x)
-            ftH, mtH, fbH = _accuracy(logitsH.argmax(-1), y, x, batcher.MASK)
-            avg_steps = n_steps_h.float().mean().item()
-        else:
-            ftH = mtH = fbH = avg_steps = float("nan")
-    return dict(
-        n1_full_token=ft1, n1_mask_token=mt1, n1_full_board=fb1,
-        nN_full_token=ftN, nN_mask_token=mtN, nN_full_board=fbN,
-        halt_full_token=ftH, halt_full_board=fbH,
-        halt_avg_steps=avg_steps, score_mean=scores.mean().item(),
-    )
+        for x, completions in eval_set.batches(batch_size, max_examples=max_examples):
+            x = x.to(device)
+            logits = model(x)
+            pred = logits.argmax(-1)
+            bsz = x.shape[0]
+            acc_sum += nqueens_accuracy(pred, x, eval_set.n) * bsz
 
+            preds = []
+            for _ in range(samples):
+                preds.append(model(x).argmax(-1).cpu())
+            sample_tensor = torch.stack(preds, dim=1)
+            cov_sum += nqueens_coverage(sample_tensor, x.cpu(), completions, eval_set.n) * bsz
+            total += bsz
+    return {
+        "accuracy": acc_sum / max(total, 1),
+        "coverage": cov_sum / max(total, 1),
+        "n_eval": total,
+    }
 
-# ----------------------------------------------------------------- main
 
 def main():
     ap = argparse.ArgumentParser()
-    # Paper hparams — defaults match arXiv:2605.19376.
-    ap.add_argument("--n",          type=int, default=8,
-                    help="N-Queens board size (8 or 10). seq_len auto-set to n*n.")
-    ap.add_argument("--b-per-step", type=int, default=64,
-                    help="per-forward batch (raise to fit your VRAM)")
-    ap.add_argument("--accum",      type=int, default=12,
-                    help="grad accumulation; effective batch = b-per-step * accum (paper: 768)")
-    ap.add_argument("--steps",      type=int, default=30_000,
-                    help="total optimizer steps")
-    ap.add_argument("--warmup",     type=int, default=1_000)
-    ap.add_argument("--lr",         type=float, default=1e-4)        # ✓ paper
-    ap.add_argument("--wd",         type=float, default=1.0)         # ✓ paper
-    ap.add_argument("--beta",       type=float, default=None,
-                    help="KL weight. If unset, paper Table values used: 0.07 (n=8), 0.045 (n=10).")
-    ap.add_argument("--kl-balance", type=float, default=0.8)         # ✓ paper (Dreamer)
-    ap.add_argument("--ema-decay",  type=float, default=0.9999)      # ✓ paper
-    ap.add_argument("--halt-weight",type=float, default=0.5)         # ⚠ guess
-    ap.add_argument("--lprm-weight",type=float, default=1.0)         # ⚠ guess
-    ap.add_argument("--log-every",  type=int, default=200)
-    ap.add_argument("--eval-every", type=int, default=2_000)
-    ap.add_argument("--ckpt-every", type=int, default=5_000)
-    ap.add_argument("--out-prefix", type=str, default=None,
-                    help="Default: gram_paper_n{n}")
-    ap.add_argument("--seed",       type=int, default=0)
-    ap.add_argument("--device",     type=str, default=None)
+    ap.add_argument("--n", type=int, default=8, choices=[8, 10])
+    ap.add_argument("--epochs", type=int, default=None, help="Paper default: 3000 for n=8, 1000 for n=10.")
+    ap.add_argument("--max-steps", type=int, default=None, help="Optional debug cap; overrides full epoch count.")
+    ap.add_argument("--global-batch", type=int, default=768)
+    ap.add_argument("--b-per-step", type=int, default=64, help="Microbatch size for gradient accumulation.")
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--wd", type=float, default=1.0)
+    ap.add_argument("--beta", type=float, default=None)
+    ap.add_argument("--kl-balance", type=float, default=0.8)
+    ap.add_argument("--ema-decay", type=float, default=0.9999)
+    ap.add_argument("--halt-weight", type=float, default=1.0)
+    ap.add_argument("--lprm-weight", type=float, default=1.0)
+    ap.add_argument("--warmup-steps", type=int, default=0, help="Paper does not specify warmup; default is none.")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--device", type=str, default=None)
+    ap.add_argument("--num-workers", type=int, default=0)
+    ap.add_argument("--log-every", type=int, default=5)
+    ap.add_argument("--eval-every", type=int, default=1000)
+    ap.add_argument("--eval-batch", type=int, default=128)
+    ap.add_argument("--eval-max", type=int, default=512, help="Use 0 for the full test set during periodic eval.")
+    ap.add_argument("--coverage-samples", type=int, default=20)
+    ap.add_argument("--ckpt-every", type=int, default=5000)
+    ap.add_argument("--out-prefix", type=str, default=None)
+    ap.add_argument("--data-cache", type=str, default=None, help="Explicit prepare_data.py cache file. Defaults to data_cache/nqueens_n{n}_seed{seed}.pt when present.")
+    ap.add_argument("--no-amp", action="store_true")
     args = ap.parse_args()
 
-    # Per-task defaults (paper Table)
-    PAPER_BETA = {8: 0.07, 10: 0.045}
-    if args.beta is None:
-        if args.n not in PAPER_BETA:
-            raise ValueError(f"--n={args.n}: paper only specifies n=8 (β=0.07) and n=10 (β=0.045). "
-                             f"Pass --beta explicitly for other sizes.")
-        args.beta = PAPER_BETA[args.n]
-    if args.out_prefix is None:
-        args.out_prefix = f"gram_paper_n{args.n}"
+    args.epochs = args.epochs if args.epochs is not None else paper_epochs(args.n)
+    args.beta = args.beta if args.beta is not None else paper_beta(args.n)
+    if args.global_batch % args.b_per_step != 0:
+        raise ValueError("--global-batch must be divisible by --b-per-step.")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}")
-    if device == "cuda":
-        print(f"gpu  : {torch.cuda.get_device_name(0)}")
-        print(f"vram : {torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
     torch.manual_seed(args.seed)
+    use_amp = (device == "cuda") and (not args.no_amp) and torch.cuda.is_bf16_supported()
+    amp_ctx = (lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)) if use_amp else _nullcontext
 
-    cfg = GRAMConfig(                            # ✓ all values match paper
-        vocab_size=3, seq_len=args.n * args.n,
-        d_model=512, n_heads=8, ffn_hidden=512, n_layers=2,
-        K=4, T=3, N_sup=16,
-        use_attn=True, use_rope=True, use_halt=True,
+    default_cache = Path("data_cache") / f"nqueens_n{args.n}_seed{args.seed}.pt"
+    data_cache = Path(args.data_cache) if args.data_cache else default_cache
+    if data_cache.exists():
+        build = load_nqueens_cache(data_cache)
+        if build.n != args.n:
+            raise ValueError(f"Cache {data_cache} is for n={build.n}, but --n={args.n}.")
+        data_source = str(data_cache)
+    else:
+        if args.data_cache:
+            raise FileNotFoundError(data_cache)
+        build = build_nqueens(args.n, seed=args.seed)
+        data_source = "generated in memory"
+
+    train_ds = NQueensTrainDataset(build)
+    test_eval = NQueensEvalSet(build, split="test")
+    dataset_batches_per_pass = steps_per_epoch(len(train_ds), args.global_batch)
+
+    cfg = GRAMConfig(
+        vocab_size=VOCAB_SIZE,
+        seq_len=args.n * args.n,
+        d_model=512,
+        n_heads=8,
+        ffn_hidden=512,
+        n_layers=2,
+        K=4,
+        T=3,
+        N_sup=16,
+        use_attn=True,
+        use_rope=True,
+        use_halt=True,
     )
     model = GRAM(cfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"task             : N-Queens {args.n}x{args.n}  (seq_len {cfg.seq_len}, β {args.beta})")
-    print(f"params           : {n_params/1e6:.2f}M")
-    print(f"transitions/step : N_sup * T = {cfg.N_sup * cfg.T}")
-
     ema = EMA(model, decay=args.ema_decay)
-    opt = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd,
-                betas=(0.9, 0.95))               # ⚠ betas guessed; paper unspecified
+    opt = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    planned_steps = args.epochs * cfg.N_sup
+    total_steps = min(planned_steps, args.max_steps) if args.max_steps else planned_steps
 
-    batcher = NQueensBatcher(n=args.n)
-    print(f"n-queens solutions: {batcher.num_solutions()}")
+    out_prefix = args.out_prefix or f"gram_nqueens_n{args.n}"
+    print(f"device           : {device}")
+    print(f"amp              : {'bf16' if use_amp else 'off'}")
+    print(f"task             : N-Queens {args.n}x{args.n}")
+    print(f"data source      : {data_source}")
+    print(f"params           : {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    print(f"raw generated pairs       : {build.raw_pairs}")
+    print(f"unique train/test inputs  : {len(build.train_inputs)} / {len(build.test_inputs)}")
+    print(f"train/test target pairs   : {build.train_pairs} / {build.test_pairs}")
+    print(f"global batch              : {args.global_batch} ({args.b_per_step} microbatch)")
+    print(f"dataset batches/pass      : {dataset_batches_per_pass}")
+    print(f"paper trajectory batches  : {args.epochs}")
+    print(f"segment updates/trajectory: {cfg.N_sup}")
+    print(f"planned training steps    : {planned_steps}")
+    print(f"running training steps    : {total_steps}")
+    print(f"beta                      : {args.beta}")
 
-    target_batch = args.b_per_step * args.accum
-    print(f"effective batch  : {args.b_per_step} * {args.accum} = {target_batch} "
-          f"(paper: 768){'  ✓' if target_batch == 768 else '  ⚠ paper used 768'}")
-
-    def lr_at(step):
-        if step < args.warmup:
-            return step / max(1, args.warmup)
-        return 1.0
-
-    # -------------------------------------------------------------- training
-    log = []
-    t0 = time.time()
-    log_path = f"{args.out_prefix}.log"
+    loader_gen = torch.Generator().manual_seed(args.seed)
+    log_path = f"{out_prefix}.log"
     logf = open(log_path, "w")
+    t0 = time.time()
+    global_step = 0
 
-    for step in range(1, args.steps + 1):
-        for g in opt.param_groups:
-            g["lr"] = args.lr * lr_at(step)
+    def lr_scale(step: int) -> float:
+        if args.warmup_steps <= 0:
+            return 1.0
+        return min(1.0, step / max(args.warmup_steps, 1))
 
-        opt.zero_grad(set_to_none=True)
-        info_accum = {"loss": 0.0, "recon": 0.0, "kl": 0.0,
-                      "lprm": 0.0, "halt": 0.0, "r": 0.0, "acc": 0.0}
-        for _ in range(args.accum):
-            x, y = batcher.sample(args.b_per_step)
-            x, y = x.to(device), y.to(device)
-            model.train()
-            loss, info = model.train_step(
-                x, y,
-                beta=args.beta, kl_balance=args.kl_balance,
-                lprm_weight=args.lprm_weight, halt_weight=args.halt_weight,
-            )
-            (loss / args.accum).backward()
-            for k in info_accum:
-                info_accum[k] += info[k] / args.accum
+    try:
+        loader = DataLoader(
+            train_ds,
+            batch_size=args.global_batch,
+            shuffle=True,
+            drop_last=False,
+            num_workers=args.num_workers,
+            generator=loader_gen,
+        )
+        loader_iter = iter(loader)
+        trajectory = 0
+        while trajectory < args.epochs and global_step < total_steps:
+            try:
+                x_global, y_global = next(loader_iter)
+            except StopIteration:
+                loader_iter = iter(loader)
+                x_global, y_global = next(loader_iter)
+            trajectory += 1
+            x_global = x_global.to(device)
+            y_global = y_global.to(device)
+            batch_actual = x_global.shape[0]
+            states = [None] * ((batch_actual + args.b_per_step - 1) // args.b_per_step)
 
-        gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
-        ema.update(model)
+            for segment in range(1, cfg.N_sup + 1):
+                if global_step >= total_steps:
+                    break
+                global_step += 1
+                for group in opt.param_groups:
+                    group["lr"] = args.lr * lr_scale(global_step)
+                opt.zero_grad(set_to_none=True)
+                info_accum = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "lprm": 0.0, "halt": 0.0, "r": 0.0, "acc": 0.0}
+                next_states = []
 
-        if step == 1 or step % args.log_every == 0:
-            msg = (f"step {step:6d} | loss {info_accum['loss']:.4f} | "
-                   f"recon {info_accum['recon']:.4f} | kl {info_accum['kl']:.4f} | "
-                   f"halt {info_accum['halt']:.4f} | lprm {info_accum['lprm']:.4f} | "
-                   f"r {info_accum['r']:.3f} | acc {info_accum['acc']:.3f} | "
-                   f"gn {gn.item():.2f} | t {time.time()-t0:.1f}s")
-            print(msg); logf.write(msg + "\n"); logf.flush()
-            log.append(dict(step=step, **info_accum,
-                            gnorm=gn.item(), t=time.time()-t0))
+                for mi, start in enumerate(range(0, batch_actual, args.b_per_step)):
+                    end = min(start + args.b_per_step, batch_actual)
+                    weight = (end - start) / batch_actual
+                    x = x_global[start:end]
+                    y = y_global[start:end]
+                    h, l = states[mi] if states[mi] is not None else (None, None)
+                    model.train()
+                    with amp_ctx():
+                        loss, info, h_next, l_next = model.train_supervision_segment(
+                            x,
+                            y,
+                            h=h,
+                            l=l,
+                            beta=args.beta,
+                            kl_balance=args.kl_balance,
+                            lprm_weight=args.lprm_weight,
+                            halt_weight=args.halt_weight,
+                        )
+                    (loss * weight).backward()
+                    next_states.append((h_next, l_next))
+                    for key in info_accum:
+                        info_accum[key] += info[key] * weight
+                states = next_states
 
-        if step % args.eval_every == 0:
-            ev_raw = evaluate(model, batcher, 128, device, N_best=20, use_ema=False)
-            ev_ema = evaluate(model, batcher, 128, device, N_best=20, use_ema=True, ema=ema)
-            for tag, ev in (("raw", ev_raw), ("EMA", ev_ema)):
-                lines = [
-                    f"  >> {tag:3s}  N=1   full_tok {ev['n1_full_token']:.3f} "
-                    f"mask {ev['n1_mask_token']:.3f} board {ev['n1_full_board']:.3f}",
-                    f"  >> {tag:3s}  N=20  full_tok {ev['nN_full_token']:.3f} "
-                    f"mask {ev['nN_mask_token']:.3f} board {ev['nN_full_board']:.3f}",
-                    f"  >> {tag:3s}  halt  full_tok {ev['halt_full_token']:.3f} "
-                    f"board {ev['halt_full_board']:.3f} avg_steps {ev['halt_avg_steps']:.2f}",
-                ]
-                for line in lines:
-                    print(line); logf.write(line + "\n")
-            logf.flush()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+                ema.update(model)
 
-        if step % args.ckpt_every == 0:
-            ckpt_path = f"{args.out_prefix}_step{step}.pt"
-            torch.save({
+                if global_step == 1 or global_step % args.log_every == 0:
+                    msg = (
+                        f"traj {trajectory:5d}/{args.epochs} seg {segment:2d}/{cfg.N_sup} "
+                        f"step {global_step:7d}/{total_steps} | "
+                        f"loss {info_accum['loss']:.4f} recon {info_accum['recon']:.4f} "
+                        f"kl {info_accum['kl']:.4f} halt {info_accum['halt']:.4f} "
+                        f"lprm {info_accum['lprm']:.4f} r {info_accum['r']:.3f} "
+                        f"acc {info_accum['acc']:.3f} gn {grad_norm.item():.2f} "
+                        f"t {time.time() - t0:.1f}s"
+                    )
+                    print(msg)
+                    logf.write(msg + "\n")
+                    logf.flush()
+
+                if args.eval_every and global_step % args.eval_every == 0:
+                    eval_max = None if args.eval_max == 0 else args.eval_max
+                    for tag, use_ema in (("raw", False), ("EMA", True)):
+                        ev = evaluate(
+                            model,
+                            test_eval,
+                            args.eval_batch,
+                            device,
+                            samples=args.coverage_samples,
+                            max_examples=eval_max,
+                            use_ema=use_ema,
+                            ema=ema,
+                        )
+                        line = (
+                            f"  >> {tag:3s} test n={ev['n_eval']} "
+                            f"acc {ev['accuracy']:.4f} coverage@{args.coverage_samples} {ev['coverage']:.4f}"
+                        )
+                        print(line)
+                        logf.write(line + "\n")
+                    logf.flush()
+
+                if args.ckpt_every and global_step % args.ckpt_every == 0:
+                    path = f"{out_prefix}_step{global_step}.pt"
+                    torch.save(
+                        {
+                            "cfg": cfg.__dict__,
+                            "model": model.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": opt.state_dict(),
+                            "step": global_step,
+                            "trajectory": trajectory,
+                            "segment": segment,
+                            "args": vars(args),
+                        },
+                        path,
+                    )
+                    print(f"  >> ckpt saved: {path}")
+    finally:
+        final_path = f"{out_prefix}_final.pt"
+        torch.save(
+            {
                 "cfg": cfg.__dict__,
                 "model": model.state_dict(),
                 "ema": ema.state_dict(),
                 "opt": opt.state_dict(),
-                "step": step,
+                "step": global_step,
                 "args": vars(args),
-            }, ckpt_path)
-            print(f"  >> ckpt saved: {ckpt_path}")
-
-    final_path = f"{args.out_prefix}_final.pt"
-    torch.save({
-        "cfg": cfg.__dict__,
-        "model": model.state_dict(),
-        "ema":   ema.state_dict(),
-        "log":   log,
-        "args":  vars(args),
-    }, final_path)
-    print(f"done — saved {final_path}")
-    logf.close()
+            },
+            final_path,
+        )
+        logf.close()
+        print(f"done - saved {final_path}")
 
 
 if __name__ == "__main__":

@@ -1,74 +1,256 @@
-"""N-Queens 8x8 data utilities for GRAM Phase 3 validation.
+"""Paper-aligned N-Queens data and metrics for GRAM.
 
-Token vocabulary (size 3):
-    0 = empty cell
-    1 = queen
-    2 = unknown / mask  (only appears in the input; never in the target)
+Paper task definition:
+  * Tokens: 0=PAD, 1=empty, 2=queen.
+  * Build all complete N-Queens solutions.
+  * For N=8 remove k in {5, 6, 7} queens; for N=10 remove k in {7, 8, 9}.
+  * The remaining partial queen configuration is the input, and a complete
+    board is the target.
+  * Train/test split is by unique input configuration, not by target pair.
 
-There are exactly 92 valid 8-queens solutions. We enumerate them once
-(~milliseconds), then at each training step sample a random solution and
-a random mask rate. The model's task: given a partial board, predict the
-full board.
+The training dataset below keeps one item per input-target pair after the
+unique-input split. Evaluation is done per unique input and uses all valid
+completions to compute constraint accuracy and sample coverage.
 """
-from typing import List, Tuple
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+from itertools import combinations
+from pathlib import Path
+from typing import Dict, Iterable, List, Sequence, Tuple
+
 import torch
+from torch.utils.data import Dataset
 
 
-def enumerate_solutions(n: int = 8) -> List[List[int]]:
-    """All n-queens solutions, each as a list of column-per-row.
-    Backtracking; for n=8 there are 92 solutions."""
-    sols: List[List[int]] = []
+PAD = 0
+EMPTY = 1
+QUEEN = 2
+VOCAB_SIZE = 3
+
+
+Board = Tuple[int, ...]
+
+
+def enumerate_solutions(n: int) -> List[Tuple[int, ...]]:
+    """Return all N-Queens solutions as column-per-row tuples."""
+    sols: List[Tuple[int, ...]] = []
     cols = [-1] * n
 
-    def back(r: int) -> None:
-        if r == n:
-            sols.append(cols.copy())
+    def backtrack(row: int) -> None:
+        if row == n:
+            sols.append(tuple(cols))
             return
-        for c in range(n):
+        for col in range(n):
             ok = True
-            for r2 in range(r):
-                c2 = cols[r2]
-                if c2 == c or abs(c2 - c) == r - r2:
+            for prev_row in range(row):
+                prev_col = cols[prev_row]
+                if prev_col == col or abs(prev_col - col) == row - prev_row:
                     ok = False
                     break
             if ok:
-                cols[r] = c
-                back(r + 1)
-    back(0)
+                cols[row] = col
+                backtrack(row + 1)
+                cols[row] = -1
+
+    backtrack(0)
     return sols
 
 
-def solutions_to_grids(sols: List[List[int]], n: int = 8) -> torch.Tensor:
-    """(N_sols, n*n) int64 0/1 grid tensor."""
-    g = torch.zeros((len(sols), n, n), dtype=torch.long)
-    for i, sol in enumerate(sols):
-        for r, c in enumerate(sol):
-            g[i, r, c] = 1
-    return g.reshape(len(sols), n * n)
+def solution_to_board(sol: Sequence[int]) -> Board:
+    n = len(sol)
+    board = [EMPTY] * (n * n)
+    for row, col in enumerate(sol):
+        board[row * n + col] = QUEEN
+    return tuple(board)
 
 
-class NQueensBatcher:
-    """Sample (input, target) pairs.
-        target: 0/1 flattened grid (length n*n)
-        input:  target with p_mask fraction of cells replaced by MASK=2
-    p_mask is sampled per-example uniformly in p_mask_range to expose the
-    model to varied difficulty levels."""
+def partial_from_solution(sol: Sequence[int], removed_rows: Iterable[int]) -> Board:
+    n = len(sol)
+    removed = set(removed_rows)
+    board = [EMPTY] * (n * n)
+    for row, col in enumerate(sol):
+        if row not in removed:
+            board[row * n + col] = QUEEN
+    return tuple(board)
 
-    MASK = 2
 
-    def __init__(self, n: int = 8, p_mask_range: Tuple[float, float] = (0.3, 0.8)):
-        self.n = n
-        self.grids = solutions_to_grids(enumerate_solutions(n), n)
-        self.p_mask_range = p_mask_range
+def default_removed_counts(n: int) -> Tuple[int, ...]:
+    if n == 8:
+        return (5, 6, 7)
+    if n == 10:
+        return (7, 8, 9)
+    raise ValueError("The paper specifies N-Queens only for n=8 and n=10.")
 
-    def num_solutions(self) -> int:
-        return len(self.grids)
 
-    def sample(self, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        idx = torch.randint(0, len(self.grids), (batch_size,))
-        y = self.grids[idx]                                              # (B, n*n)
-        p_lo, p_hi = self.p_mask_range
-        p = torch.empty(batch_size, 1).uniform_(p_lo, p_hi)
-        mask = torch.rand(y.shape) < p
-        x = torch.where(mask, torch.full_like(y, self.MASK), y)
-        return x, y
+@dataclass(frozen=True)
+class NQueensBuild:
+    n: int
+    train_inputs: List[Board]
+    test_inputs: List[Board]
+    completions: Dict[Board, Tuple[Board, ...]]
+    raw_pairs: int
+
+    @property
+    def train_pairs(self) -> int:
+        return sum(len(self.completions[x]) for x in self.train_inputs)
+
+    @property
+    def test_pairs(self) -> int:
+        return sum(len(self.completions[x]) for x in self.test_inputs)
+
+
+def build_nqueens(
+    n: int,
+    *,
+    seed: int = 0,
+    train_fraction: float = 0.85,
+    removed_counts: Sequence[int] | None = None,
+) -> NQueensBuild:
+    """Generate paper-style N-Queens inputs and split by unique input."""
+    removed_counts = tuple(removed_counts or default_removed_counts(n))
+    sols = enumerate_solutions(n)
+    completions_mut: Dict[Board, set[Board]] = {}
+    raw_pairs = 0
+
+    for sol in sols:
+        target = solution_to_board(sol)
+        for k in removed_counts:
+            for removed_rows in combinations(range(n), k):
+                x = partial_from_solution(sol, removed_rows)
+                completions_mut.setdefault(x, set()).add(target)
+                raw_pairs += 1
+
+    keys = list(completions_mut)
+    random.Random(seed).shuffle(keys)
+    cut = int(len(keys) * train_fraction)
+    train_inputs = keys[:cut]
+    test_inputs = keys[cut:]
+    completions = {
+        x: tuple(sorted(targets))
+        for x, targets in completions_mut.items()
+    }
+    return NQueensBuild(
+        n=n,
+        train_inputs=train_inputs,
+        test_inputs=test_inputs,
+        completions=completions,
+        raw_pairs=raw_pairs,
+    )
+
+
+def _board_tuple(value) -> Board:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    return tuple(int(v) for v in value)
+
+
+def load_nqueens_cache(path: str | Path) -> NQueensBuild:
+    """Load an explicitly materialized N-Queens dataset from prepare_data.py."""
+    payload = torch.load(Path(path), map_location="cpu")
+    if payload.get("task") != "nqueens":
+        raise ValueError(f"Expected an nqueens cache file, got task={payload.get('task')!r}.")
+
+    completions = {
+        _board_tuple(x): tuple(_board_tuple(y) for y in targets)
+        for x, targets in payload["completions"].items()
+    }
+    metadata = payload.get("metadata", {})
+    return NQueensBuild(
+        n=int(payload["n"]),
+        train_inputs=[_board_tuple(x) for x in payload["train_inputs_unique"]],
+        test_inputs=[_board_tuple(x) for x in payload["test_inputs_unique"]],
+        completions=completions,
+        raw_pairs=int(metadata.get("raw_generated_pairs", 0)),
+    )
+
+
+class NQueensTrainDataset(Dataset):
+    """One item per input-target pair after splitting by unique input."""
+
+    def __init__(self, build: NQueensBuild):
+        self.n = build.n
+        pairs: List[Tuple[Board, Board]] = []
+        for x in build.train_inputs:
+            for y in build.completions[x]:
+                pairs.append((x, y))
+        self.pairs = pairs
+
+    def __len__(self) -> int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int):
+        x, y = self.pairs[idx]
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+
+class NQueensEvalSet:
+    """Unique-input evaluation set with all valid completions per input."""
+
+    def __init__(self, build: NQueensBuild, split: str = "test"):
+        self.n = build.n
+        inputs = build.test_inputs if split == "test" else build.train_inputs
+        self.examples = [(x, build.completions[x]) for x in inputs]
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def batches(self, batch_size: int, max_examples: int | None = None):
+        examples = self.examples[:max_examples] if max_examples else self.examples
+        for start in range(0, len(examples), batch_size):
+            chunk = examples[start : start + batch_size]
+            x = torch.tensor([e[0] for e in chunk], dtype=torch.long)
+            completions = [e[1] for e in chunk]
+            yield x, completions
+
+
+def steps_per_epoch(num_examples: int, global_batch_size: int) -> int:
+    return math.ceil(num_examples / global_batch_size)
+
+
+def is_valid_completion(pred: Sequence[int], partial: Sequence[int], n: int) -> bool:
+    if len(pred) != n * n:
+        return False
+    queens: List[Tuple[int, int]] = []
+    for idx, token in enumerate(pred):
+        if token not in (EMPTY, QUEEN):
+            return False
+        if partial[idx] == QUEEN and token != QUEEN:
+            return False
+        if token == QUEEN:
+            queens.append((idx // n, idx % n))
+    if len(queens) != n:
+        return False
+    rows = {r for r, _ in queens}
+    cols = {c for _, c in queens}
+    diag1 = {r - c for r, c in queens}
+    diag2 = {r + c for r, c in queens}
+    return len(rows) == len(cols) == len(diag1) == len(diag2) == n
+
+
+def nqueens_accuracy(pred: torch.Tensor, x: torch.Tensor, n: int) -> float:
+    correct = 0
+    pred_l = pred.detach().cpu().tolist()
+    x_l = x.detach().cpu().tolist()
+    for p, partial in zip(pred_l, x_l):
+        correct += int(is_valid_completion(p, partial, n))
+    return correct / max(len(pred_l), 1)
+
+
+def nqueens_coverage(samples: torch.Tensor, x: torch.Tensor, completions: List[Tuple[Board, ...]], n: int) -> float:
+    """samples: (B, S, L) predicted token ids."""
+    total = 0.0
+    samples_l = samples.detach().cpu().tolist()
+    x_l = x.detach().cpu().tolist()
+    for preds, partial, valid_targets in zip(samples_l, x_l, completions):
+        target_set = set(valid_targets)
+        found = set()
+        for pred in preds:
+            pred_t = tuple(pred)
+            if pred_t in target_set and is_valid_completion(pred_t, partial, n):
+                found.add(pred_t)
+        total += len(found) / max(len(target_set), 1)
+    return total / max(len(completions), 1)

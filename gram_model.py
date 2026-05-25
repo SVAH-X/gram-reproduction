@@ -16,6 +16,7 @@ Final hidden h_T feeds value_head (LPRM) for best-of-N selection at inference.
 from dataclasses import dataclass
 from contextlib import contextmanager
 from typing import Optional
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +26,7 @@ import torch.nn.functional as F
 class GRAMConfig:
     vocab_size: int = 3
     seq_len:    int = 64
+    target_seq_len: Optional[int] = None
     d_model:    int = 512
     n_heads:    int = 8
     ffn_hidden: int = 512
@@ -36,6 +38,13 @@ class GRAMConfig:
     use_rope:   bool = True
     use_halt:   bool = True
     rope_theta: float = 10000.0
+    # Paper B.1: "prepended with 16 puzzle embedding tokens".
+    # HRM-style register tokens read by the halt/value heads via h[:,0].
+    num_puzzle_tokens: int = 16
+
+    @property
+    def state_seq_len(self) -> int:
+        return self.seq_len + self.num_puzzle_tokens
 
 
 # ---------------------------------------------------------------- norms / FFN
@@ -104,7 +113,7 @@ class Attention(nn.Module):
         self.qkv  = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         if cfg.use_rope:
-            cos, sin = precompute_rope(self.dh, cfg.seq_len, cfg.rope_theta)
+            cos, sin = precompute_rope(self.dh, cfg.state_seq_len, cfg.rope_theta)
             self.register_buffer("rope_cos", cos, persistent=False)
             self.register_buffer("rope_sin", sin, persistent=False)
 
@@ -180,6 +189,11 @@ class StochasticGuidance(nn.Module):
 
 
 def kl_gaussian(mu_q, lv_q, mu_p, lv_p):
+    # Force fp32 — under bf16 autocast, var.exp() and var division can lose
+    # precision and cause KL drift. Inputs come from clamped log_var so the
+    # cast back to fp32 is cheap and exact.
+    mu_q = mu_q.float(); lv_q = lv_q.float()
+    mu_p = mu_p.float(); lv_p = lv_p.float()
     var_q = lv_q.exp()
     var_p = lv_p.exp()
     return 0.5 * (var_q / var_p
@@ -189,32 +203,36 @@ def kl_gaussian(mu_q, lv_q, mu_p, lv_p):
 
 
 class ValueHead(nn.Module):
-    """LPRM. Predicts r in [0, 1] from h_T. Trained by MSE against the
-    per-example correctness of a fully prior-sampled trajectory."""
+    """LPRM (V-head). Paper Table 4: Linear(D -> 1).
+
+    It reads the first token of h and predicts r in [0, 1]. Earlier local
+    versions used a SwiGLU projection here, which inflated the model by about
+    0.8M parameters per head and moved it away from the paper's ~10M setting.
+    """
     def __init__(self, cfg: GRAMConfig):
         super().__init__()
         self.norm = RMSNorm(cfg.d_model)
-        self.proj = SwiGLU(cfg.d_model, cfg.ffn_hidden, cfg.d_model)
         self.head = nn.Linear(cfg.d_model, 1, bias=True)
 
     def forward(self, h):
-        z = self.proj(self.norm(h)).mean(dim=1)
+        z = self.norm(h[:, 0])
         return torch.sigmoid(self.head(z).squeeze(-1))
 
 
 class HaltHead(nn.Module):
-    """ACT halt-only head (paper Appendix A.1). Per supervision step s, given
-    h_s, predict whether the prediction is already correct. At inference,
-    halt as soon as sigmoid(q^halt) > 0.5."""
+    """ACT halt-only Q-head. Paper Table 4: Linear(D -> 2).
+
+    We keep the paper's released-code simplification described in Appendix A.1:
+    inference can use only q^halt with threshold 0.5.
+    """
     def __init__(self, cfg: GRAMConfig):
         super().__init__()
         self.norm = RMSNorm(cfg.d_model)
-        self.proj = SwiGLU(cfg.d_model, cfg.ffn_hidden, cfg.d_model)
-        self.head = nn.Linear(cfg.d_model, 1, bias=True)
+        self.head = nn.Linear(cfg.d_model, 2, bias=True)
 
     def forward(self, h):
-        z = self.proj(self.norm(h)).mean(dim=1)
-        return self.head(z).squeeze(-1)         # raw logit
+        z = self.norm(h[:, 0])
+        return self.head(z)                     # (B, 2): [halt_q, continue_q]
 
 
 # ---------------------------------------------------------- EMA
@@ -266,10 +284,19 @@ class GRAM(nn.Module):
     def __init__(self, cfg: GRAMConfig):
         super().__init__()
         self.cfg = cfg
+        self.target_seq_len = cfg.target_seq_len or cfg.seq_len
+        self.num_puzzle_tokens = cfg.num_puzzle_tokens
+        state_seq_len = cfg.state_seq_len
+
         self.token_embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        # Paper B.1: 16 prepended puzzle/register tokens, shared across the
+        # batch and learned. The halt and value heads read position 0.
+        self.puzzle_embed = nn.Parameter(
+            torch.randn(1, cfg.num_puzzle_tokens, cfg.d_model) * 0.02
+        )
         # learned pos embed only used when RoPE is off
         if not cfg.use_rope:
-            self.pos_embed = nn.Parameter(torch.zeros(1, cfg.seq_len, cfg.d_model))
+            self.pos_embed = nn.Parameter(torch.zeros(1, state_seq_len, cfg.d_model))
 
         self.f_L           = RecursiveModule(cfg)
         self.f_H           = RecursiveModule(cfg)
@@ -277,20 +304,55 @@ class GRAM(nn.Module):
         self.guidance_post = StochasticGuidance(cfg)   # posterior q_phi(eps|u,e_y)
 
         self.norm_out  = RMSNorm(cfg.d_model)
-        self.lm_head   = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        # Paper Table 4: Linear(D -> vocab).
+        self.lm_head   = nn.Linear(cfg.d_model, cfg.vocab_size, bias=True)
         self.value_head = ValueHead(cfg)
         if cfg.use_halt:
             self.halt_head = HaltHead(cfg)
 
-        # Frozen z_0 = (h_0, l_0)
-        self.register_buffer("h0", torch.randn(1, cfg.seq_len, cfg.d_model))
-        self.register_buffer("l0", torch.randn(1, cfg.seq_len, cfg.d_model))
+        if self.target_seq_len != cfg.seq_len:
+            self.target_to_state = nn.Linear(self.target_seq_len, cfg.seq_len, bias=False)
+            self.state_to_target = nn.Linear(cfg.seq_len, self.target_seq_len, bias=False)
+        else:
+            self.target_to_state = None
+            self.state_to_target = None
+
+        # Frozen z_0 = (h_0, l_0). State length includes 16 puzzle positions.
+        self.register_buffer("h0", torch.randn(1, state_seq_len, cfg.d_model))
+        self.register_buffer("l0", torch.randn(1, state_seq_len, cfg.d_model))
 
     def encode(self, x_ids):
-        e = self.token_embed(x_ids)
+        # Paper B.1: scale by sqrt(D), then prepend 16 puzzle embedding tokens.
+        B = x_ids.shape[0]
+        e = self.token_embed(x_ids) * math.sqrt(self.cfg.d_model)
+        puzzle = self.puzzle_embed.expand(B, -1, -1)
+        e = torch.cat([puzzle, e], dim=1)
         if not self.cfg.use_rope:
             e = e + self.pos_embed
         return e
+
+    def encode_target_as_state(self, y_ids):
+        # Paper supports posterior conditioning on the target. The target lives
+        # in the content portion of the latent state; puzzle positions get a
+        # zero conditioning signal so they are still driven by the prior.
+        B = y_ids.shape[0]
+        e_y = self.token_embed(y_ids) * math.sqrt(self.cfg.d_model)
+        if self.target_to_state is not None:
+            e_y = self.target_to_state(e_y.transpose(1, 2)).transpose(1, 2)
+        pad = torch.zeros(
+            B, self.num_puzzle_tokens, self.cfg.d_model,
+            dtype=e_y.dtype, device=e_y.device,
+        )
+        return torch.cat([pad, e_y], dim=1)
+
+    def decode(self, h):
+        # Paper B.1: "The decoder extracts content tokens (excluding puzzle
+        # embedding positions) and maps them to logits via a SwiGLU MLP head."
+        h_content = h[:, self.num_puzzle_tokens:]
+        z = self.norm_out(h_content)
+        if self.state_to_target is not None:
+            z = self.state_to_target(z.transpose(1, 2)).transpose(1, 2)
+        return self.lm_head(z)
 
     def _propose(self, h_prev, l_prev, e_x):
         l = l_prev
@@ -311,6 +373,92 @@ class GRAM(nn.Module):
         eps = mu_q + (0.5 * lv_q).exp() * torch.randn_like(mu_q)
         return u + eps, l, (mu_p, lv_p), (mu_q, lv_q)
 
+    def initial_state(self, batch_size: int, device=None):
+        device = device or self.h0.device
+        h = self.h0.expand(batch_size, -1, -1).to(device).contiguous()
+        l = self.l0.expand(batch_size, -1, -1).to(device).contiguous()
+        return h, l
+
+    def train_supervision_segment(self, x_ids, y_ids, h=None, l=None,
+                                  beta: float = 0.07,
+                                  kl_balance: float = 0.8,
+                                  lprm_weight: float = 1.0,
+                                  halt_weight: float = 0.5,
+                                  y_mask: Optional[torch.Tensor] = None):
+        """Train exactly one deep-supervision segment.
+
+        This is the paper-aligned update unit: each segment runs T transitions,
+        propagates gradients only through the final transition, applies the
+        surrogate objective for that segment, and returns detached terminal
+        state for the next segment.
+        """
+        B = x_ids.shape[0]
+        e_x = self.encode(x_ids)
+        e_y = self.encode_target_as_state(y_ids)
+        if h is None or l is None:
+            h, l = self.initial_state(B, x_ids.device)
+
+        n_valid = y_mask.float().sum(-1).clamp(min=1.0) if y_mask is not None else None
+
+        with torch.no_grad():
+            for _ in range(self.cfg.T - 1):
+                h, l, _, _ = self.transition(h, l, e_x)
+        h, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
+
+        logits = self.decode(h)
+        if y_mask is None:
+            recon = F.cross_entropy(
+                logits.reshape(-1, self.cfg.vocab_size),
+                y_ids.reshape(-1),
+            )
+        else:
+            y_for_loss = y_ids.masked_fill(~y_mask, -100)
+            recon = F.cross_entropy(
+                logits.reshape(-1, self.cfg.vocab_size),
+                y_for_loss.reshape(-1),
+                ignore_index=-100,
+            )
+
+        kl_post_grad = kl_gaussian(mu_q, lv_q, mu_p.detach(), lv_p.detach()).mean()
+        kl_prior_grad = kl_gaussian(mu_q.detach(), lv_q.detach(), mu_p, lv_p).mean()
+        kl = kl_balance * kl_prior_grad + (1.0 - kl_balance) * kl_post_grad
+        elbo_loss = recon + beta * kl
+
+        with torch.no_grad():
+            pred = logits.argmax(-1)
+            correct = pred == y_ids
+            if y_mask is None:
+                target = correct.float().mean(dim=-1)
+                acc = target.mean()
+            else:
+                target = (correct & y_mask).float().sum(-1) / n_valid
+                acc = ((correct & y_mask).float().sum() / y_mask.float().sum().clamp(min=1)).detach()
+
+        halt_loss = torch.tensor(0.0, device=elbo_loss.device)
+        if self.cfg.use_halt:
+            # Appendix A.1: ACT loss contributes only through the halt head.
+            halt_logits = self.halt_head(h.detach())
+            halt_loss = F.binary_cross_entropy_with_logits(halt_logits[:, 0], target)
+
+        # Appendix A.2: value head predicts trajectory quality from latent state.
+        # Detach h so the reward model does not alter the recursive core update.
+        score = self.value_head(h.detach())
+        lprm_loss = F.mse_loss(score, target)
+
+        loss = elbo_loss + lprm_weight * lprm_loss
+        if self.cfg.use_halt:
+            loss = loss + halt_weight * halt_loss
+
+        return loss, {
+            "loss": loss.item(),
+            "recon": recon.item(),
+            "kl": kl.item(),
+            "lprm": lprm_loss.item(),
+            "halt": halt_loss.item() if self.cfg.use_halt else 0.0,
+            "r": target.mean().item(),
+            "acc": acc.item(),
+        }, h.detach(), l.detach()
+
     @torch.no_grad()
     def _run_prior_trajectory(self, e_x):
         B = e_x.shape[0]
@@ -324,7 +472,7 @@ class GRAM(nn.Module):
     def forward(self, x_ids):
         e_x = self.encode(x_ids)
         h_T = self._run_prior_trajectory(e_x)
-        return self.lm_head(self.norm_out(h_T))
+        return self.decode(h_T)
 
     @torch.no_grad()
     def forward_best_of_n(self, x_ids, N: int = 20):
@@ -338,7 +486,7 @@ class GRAM(nn.Module):
         h_T    = h_T.view(B, N, *h_T.shape[1:])
         best   = scores.argmax(dim=1)
         best_h = h_T[torch.arange(B), best]
-        return self.lm_head(self.norm_out(best_h)), scores
+        return self.decode(best_h), scores
 
     @torch.no_grad()
     def forward_with_halt(self, x_ids, halt_thresh: float = 0.5):
@@ -359,7 +507,7 @@ class GRAM(nn.Module):
         for s in range(self.cfg.N_sup):
             for _ in range(self.cfg.T):
                 h, l, _, _ = self.transition(h, l, e_x)
-            halt_p = torch.sigmoid(self.halt_head(h))            # (B,)
+            halt_p = torch.sigmoid(self.halt_head(h)[:, 0])      # (B,)
             new_halt = (~halted) & (halt_p > halt_thresh)
             h_final[new_halt] = h[new_halt]
             n_steps[new_halt] = s + 1
@@ -370,21 +518,23 @@ class GRAM(nn.Module):
         not_halted = ~halted
         h_final[not_halted] = h[not_halted]
         n_steps[not_halted] = self.cfg.N_sup
-        return self.lm_head(self.norm_out(h_final)), n_steps
+        return self.decode(h_final), n_steps
 
     def train_step(self, x_ids, y_ids, beta: float = 0.07,
                    kl_balance: float = 0.8,
                    lprm_weight: float = 1.0,
                    halt_weight: float = 0.5,
                    y_mask: Optional[torch.Tensor] = None):
-        """y_mask: optional bool (B, S). When provided, recon CE is computed
+        """Train one batch with optional target masking.
+
+        x_ids has shape (B, input_seq_len). y_ids has shape
+        (B, target_seq_len), where target_seq_len may differ from input_seq_len.
+        y_mask is optional bool (B, target_seq_len). When provided, recon CE is computed
         only at True positions, and halt-target / acc / LPRM-target are
-        per-example correctness over True positions only. Used for graph
-        coloring where adjacency tokens are input-only. y_ids must contain
-        valid token ids everywhere (the posterior embedding e_y reads it)."""
+        per-example correctness over True positions only."""
         B = x_ids.shape[0]
         e_x = self.encode(x_ids)
-        e_y = self.encode(y_ids)
+        e_y = self.encode_target_as_state(y_ids)
         h = self.h0.expand(B, -1, -1).contiguous()
         l = self.l0.expand(B, -1, -1).contiguous()
 
@@ -401,7 +551,7 @@ class GRAM(nn.Module):
                     h, l, _, _ = self.transition(h, l, e_x)
             h, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
 
-            logits = self.lm_head(self.norm_out(h))
+            logits = self.decode(h)
             if y_mask is None:
                 recon = F.cross_entropy(
                     logits.reshape(-1, self.cfg.vocab_size),
@@ -431,8 +581,8 @@ class GRAM(nn.Module):
                         target = correct.float().mean(dim=-1)
                     else:
                         target = (correct & y_mask).float().sum(-1) / n_valid
-                halt_logit = self.halt_head(h)
-                halt = F.binary_cross_entropy_with_logits(halt_logit, target)
+                halt_logits = self.halt_head(h)                  # (B, 2)
+                halt = F.binary_cross_entropy_with_logits(halt_logits[:, 0], target)
                 halt_sum = halt_sum + halt
 
             with torch.no_grad():
@@ -456,7 +606,7 @@ class GRAM(nn.Module):
         # value head MSE against per-example correctness rate.
         h_prior_T = self._run_prior_trajectory(e_x)
         with torch.no_grad():
-            logits_p = self.lm_head(self.norm_out(h_prior_T))
+            logits_p = self.decode(h_prior_T)
             correct_p = (logits_p.argmax(-1) == y_ids)
             if y_mask is None:
                 r = correct_p.float().mean(dim=-1)

@@ -1,113 +1,129 @@
 # GRAM Reproduction
 
-Implementation of **Generative Recursive Reasoning** (Baek, Jo, Kim, Ren, Bengio, Ahn — arXiv:2605.19376, May 2026), reproduced from the paper alone (the official code is not yet public). Trained on N-Queens 8×8.
+From-paper reproduction of **Generative Recursive Reasoning** (Baek et al., arXiv:2605.19376) on the two multi-solution constraint-satisfaction tasks (N-Queens and 3-Graph Coloring). The model matches paper Appendix B (10.5 M params, K=4, T=3, N_sup=16, RoPE, SwiGLU, RMSNorm, 16 prepended puzzle/register tokens) and the dataset structure matches Appendix C.2 exactly (all four cache files pass 84 paper-strict checks; every one of the 618 020 cached solutions is a real constraint-satisfying answer).
 
-The model implements:
-
-- Truncated surrogate ELBO over deep-supervision steps
-- Amortized variational inference with shared `f_L` / `f_H` recursive modules between prior `p_θ(ε|u)` and posterior `q_φ(ε|u, e_y)`
-- Dreamer-style balanced KL: `α·KL(sg(q)||p) + (1−α)·KL(q||sg(p))` with α=0.8
-- LPRM (Latent Process Reward Model) value head for best-of-N selection
-- ACT halt-only Q-head (paper Appendix A.1)
-- RoPE positional encoding
-- EMA of model weights (decay 0.9999)
-
-## Files
-
-### Model + data (always loaded)
-| file | what |
-| --- | --- |
-| `gram_model.py` | Model definition. Module is named `gram_model` (not `gram`) because the PyPI `gram` package shadows the import. |
-| `data_nqueens.py` | Enumerates all 92 N-Queens 8×8 solutions, masks at p∈[0.3,0.8] |
-
-### Paper-scale training
-| file | task | β default | how to run |
-| --- | --- | --- | --- |
-| `gram_paper.ipynb`         | N-Queens 8×8 (Jupyter) | 0.07 | open in JupyterLab |
-| `train_paper.py`           | N-Queens 8×8 / 10×10   | auto: 0.07 / 0.045 | `python train_paper.py --n 8` |
-| `train_graph_coloring.py`  | Graph 3-Coloring N=8/10 | auto: 0.5 / 0.45 | `python train_graph_coloring.py --n 8` |
-| `data_graph_coloring.py`   | shared by graph coloring training | — | imported |
-
-All three use the same `gram_model.GRAM` with the same architecture (D=512, K=4, T=3, N_sup=16) and the same optimizer / EMA / LPRM / halt machinery. They differ only in data + β.
-
-### Laptop validation (small config — NOT paper-scale)
-| file | what | typical runtime |
-| --- | --- | --- |
-| `smoke_test.py`     | Phase-1 forward-pass shape test. D=128, no training. | seconds |
-| `train_smoke.py`    | Phase-2 synthetic ELBO check (y = reverse(x)). D=128, β=0.3, 600 steps. | ~1 min |
-| `train_nqueens.py`  | Phase-3a small N-Queens validation. D=128, β=0.1, 1000 steps. **Will not reach paper numbers** — it's intentionally tiny so it finishes on a MacBook. | ~90 s on MPS |
-
-The laptop scripts use **lr=1e-3, wd=0.01, batch=32, no EMA, no RoPE, no halt** because at D=128 paper hparams over-regularize the small model. They are scaffolding to verify the math; they are not the experiment.
-
-## Hyperparameter alignment with paper
-
-| symbol | paper | this repo | confidence |
-| --- | --- | --- | --- |
-| D (d_model) | 512 | 512 | ✓ paper |
-| heads | 8 | 8 | ✓ paper |
-| FFN hidden | 512 | 512 | ✓ paper |
-| f_L, f_H layers | 2 each | 2 each | ✓ paper |
-| K (inner loop) — N-Queens | 4 | 4 | ✓ paper |
-| T (transitions/step) | 3 | 3 | ✓ paper |
-| N_sup (sup. steps) | 16 | 16 | ✓ paper |
-| β (KL weight) — N-Queens 8×8 | 0.07 | 0.07 | ✓ paper |
-| KL balance α | 0.8 (Dreamer) | 0.8 | ✓ paper |
-| AdamW lr | 1e-4 | 1e-4 | ✓ paper |
-| AdamW wd | 1.0 | 1.0 | ✓ paper |
-| grad clip | 1.0 | 1.0 | ✓ paper |
-| EMA decay | 0.9999 | 0.9999 | ✓ paper |
-| **batch size (global)** | **768** (8×4090) | **768** (B=64 × accum=12) | ✓ matched via grad accum |
-| Halt threshold σ(q^halt)>0.5 | 0.5 | 0.5 | ✓ paper |
-| RoPE θ | not specified | 10000 | ⚠️ standard default |
-| AdamW betas | not specified in our notes | (0.9, 0.95) | ⚠️ guess (modern-LLM default) |
-| Warmup schedule | not specified in our notes | 1000-step linear | ⚠️ guess |
-| halt loss weight | not specified in our notes | 0.5 | ⚠️ guess |
-| LPRM loss weight | not specified in our notes | 1.0 | ⚠️ guess |
-| Training length | "3000 epochs" (paper) | 30,000 optimizer steps ≈ 23M effective samples | ⚠️ epoch→step conversion ambiguous; tune if not converged |
-
-The ⚠️ rows are the parameters most likely to need tuning. If the paper code drops, prefer those values over my guesses.
-
-## Quickstart on a remote GPU
+## Setup
 
 ```bash
-git clone https://github.com/SVAH-X/gram-reproduction.git
-cd gram-reproduction
-pip install -r requirements.txt          # only torch + nbformat
+# 1. CUDA-enabled PyTorch
+pip install -r requirements.txt
 
-# Option A — Jupyter notebook
-jupyter notebook gram_paper.ipynb        # or upload to JupyterHub / Colab
+# 2. Build the synthetic data once (writes ~250 MB into data_cache/)
+python prepare_data.py --out-dir data_cache --seed 0 --p-edge 0.4
 
-# Option B — pure Python (preferred for headless servers / nohup / tmux)
-python train_paper.py                                    # N-Queens 8x8, 30k steps, batch 64*12=768
-python train_paper.py --n 10                             # N-Queens 10x10 (β=0.045 auto-selected)
-python train_graph_coloring.py --n 8                     # Graph 3-coloring N=8 (β=0.5 auto)
-python train_graph_coloring.py --n 10                    # Graph 3-coloring N=10 (β=0.45 auto)
-python train_paper.py --b-per-step 128 --accum 6         # 24+ GB VRAM
-nohup python train_paper.py --n 10 > paper_n10.out 2>&1 &  # detached run
+# 3. Optional sanity checks
+python verify_datasets.py
+python verify_solutions_exhaustive.py
+python analyze_data.py --data-dir data_cache
 ```
 
-Both paths print loss/recon/KL/halt/LPRM every 200 steps and a full eval (best-of-1, best-of-20, halt) every 2,000 steps for both raw and EMA weights. Checkpoints land in `gram_paper_step{N}.pt` every 5,000 steps.
+## Training on the 4×A100 server
 
-VRAM budget: at `B_per_step=64`, D=512 the model fits in ~10–12 GB. To match paper batch=768 we use gradient accumulation `accum_steps=12` (so `64 × 12 = 768`). If your card has more VRAM, raise `B_per_step` and lower `accum_steps` proportionally — the effective batch must stay 768.
+`train_paper.py` and `train_graph_coloring.py` are single-process training scripts. They use bf16 autocast on CUDA and gradient accumulation to reach the paper's global batch size of 768 on **one** GPU. To use all four A100s, launch four runs in parallel on the four task / size combinations:
 
-Wall-clock estimate: paper reports ~1 h on 8×4090 for N-Queens 8×8. With grad accum on a single GPU expect roughly **8× longer per effective batch** plus arithmetic for the smaller per-step batch — budget ~12–24 h on a single A100/4090, longer on weaker cards.
+```bash
+# pin each task to its own GPU
+CUDA_VISIBLE_DEVICES=0 nohup python -u train_paper.py            --n 8  --out-prefix gram_nqueens_n8     > nq8.out  2>&1 &
+CUDA_VISIBLE_DEVICES=1 nohup python -u train_paper.py            --n 10 --out-prefix gram_nqueens_n10    > nq10.out 2>&1 &
+CUDA_VISIBLE_DEVICES=2 nohup python -u train_graph_coloring.py   --n 8  --out-prefix gram_graphcolor_n8  > gc8.out  2>&1 &
+CUDA_VISIBLE_DEVICES=3 nohup python -u train_graph_coloring.py   --n 10 --out-prefix gram_graphcolor_n10 > gc10.out 2>&1 &
+```
 
-## Pass criteria
+A100 has ~3× the FLOPs of the RTX 4090 the paper used, so each task should fit comfortably on a single GPU at `--global-batch 768 --b-per-step 64` (defaults). If you OOM, drop `--b-per-step` to 32 or 16 — the script keeps the effective batch at 768 via gradient accumulation. Checkpoints land in the working directory as `<prefix>_step*.pt` and `<prefix>_final.pt`; logs in `<prefix>.log`.
 
-Paper-reported numbers (Table 2):
-- **N-Queens 8×8: 99.7% acc / 90.3% cov**  (β=0.07)
-- **N-Queens 10×10: 89.7% acc / 57.5% cov** (β=0.045)
-- **Graph Coloring N=8: 2.7 conflict edges**  (β=0.5)
-- **Graph Coloring N=10: 3.3 conflict edges** (β=0.45)
+After training, run paper-style evaluation against the full test set:
 
-Reproduction targets for N-Queens (`train_paper.py --n 8` / `--n 10`):
+```bash
+python eval_paper.py --task nqueens   --n 8  --checkpoint gram_nqueens_n8_final.pt    --use-ema --batch-size 64
+python eval_paper.py --task nqueens   --n 10 --checkpoint gram_nqueens_n10_final.pt   --use-ema --batch-size 64
+python eval_paper.py --task graphcolor --n 8  --checkpoint gram_graphcolor_n8_final.pt  --use-ema --batch-size 64
+python eval_paper.py --task graphcolor --n 10 --checkpoint gram_graphcolor_n10_final.pt --use-ema --batch-size 64
+```
 
-- **EMA best-of-1 full_token > 0.99** (= paper "acc")
-- **EMA best-of-20 full_board > 0.85** (≈ paper "cov" = best-of-N coverage)
-- **Halt avg_steps < N_sup** when full_board is high — model has learned to stop early
-- corr(score, reward) > 0.7 — LPRM is informative
-- distinct preds / 20 samples > 5 — prior has not collapsed
+Outputs go to `data_cache/analysis/eval_*.json` and `eval_*.buckets.csv`.
 
-## Critical implementation note
+## How epochs / steps are designed (paper-strict)
 
-`RecursiveModule` (the f_L / f_H stack) **must** end in an RMSNorm. Without it, the residual stream summed across K inner iterations × N_sup·T transitions explodes (u std ~3.8 → mu/log_var heads see huge inputs → KL element-wise ~30,000 → loss NaN at step 1). The paper does not call this out explicitly. See `RecursiveModule` in `gram_model.py`.
+The paper reports "epochs" in Appendix B.2 Table 7. Throughout the GRAM/HRM/TRM line, **one epoch == one trajectory batch** — a global batch of 768 examples that is run through the *entire* recursive trajectory of `T_total = T × N_sup` transitions. Within that single trajectory the optimizer takes `N_sup = 16` gradient steps, one per supervision segment (Appendix A.3 / Eq. 14).
+
+This repo follows that convention literally:
+
+```
+total optimizer steps = (paper epochs) × N_sup
+```
+
+| task          | paper epochs | N_sup | total optimizer steps |
+|---------------|-------------:|------:|----------------------:|
+| N-Queens 8×8  |         3000 |    16 |                48 000 |
+| N-Queens 10×10|         1000 |    16 |                16 000 |
+| Graph Color 8 |         5000 |    16 |                80 000 |
+| Graph Color 10|         5000 |    16 |                80 000 |
+
+The training scripts print `paper trajectory batches`, `segment updates/trajectory`, and `planned training steps` so you can read this directly off the run header. Each segment update is one `opt.step()` call on a global batch of 768 examples — exactly what the paper trains on. Set `--max-steps` to cap early during smoke runs.
+
+Other paper-exact knobs already wired in:
+
+- **AdamW**: lr=1e-4, weight_decay=1.0, gradient clipping at 1.0.
+- **Global batch = 768**, microbatch defaults to 64 (gradient accumulation x12).
+- **EMA decay = 0.9999** (applied every optimizer step; eval uses EMA weights when `--use-ema` is set).
+- **KL balance β_bal = 0.8** (Appendix B.2).
+- **β (KL weight) per task**: 0.07 / 0.045 / 0.5 / 0.45 for NQ-8 / NQ-10 / GC-8 / GC-10 (auto-selected, override with `--beta`).
+- **No LR warmup** (paper does not specify one, and `lr=1e-4` is stated as the constant rate).
+- **bf16 autocast** on A100; KL is computed in fp32 to keep gradient signal stable.
+
+## Live monitoring
+
+Both training scripts log every 5 optimizer steps by default:
+
+```
+traj  123/3000 seg  7/16 step    1979/48000 | loss 0.4187 recon 0.1284 kl 1.43 halt 0.04 lprm 0.001 r 0.973 acc 0.984 gn 0.61 t 412.3s
+  >> raw test n=512 acc 0.9821 coverage@20 0.7864
+  >> EMA test n=512 acc 0.9893 coverage@20 0.8194
+```
+
+Eval rolls every 1000 steps by default (`--eval-every`). To tail a run:
+
+```bash
+tail -f gram_nqueens_n8.log
+```
+
+To plot live or after-the-fact (publication-quality, via SciencePlots):
+
+```bash
+python plot_results.py curves   --log gram_nqueens_n8.log
+python plot_results.py hist     --data-dir data_cache
+python plot_results.py coverage --buckets data_cache/analysis/eval_nqueens_n8.buckets.csv
+```
+
+Figures are written to `data_cache/analysis/figs/`.
+
+## What's been verified before launch
+
+- Model architecture re-derived from paper Appendix B; param count 10.51 M (paper says ~10 M).
+- 16 prepended puzzle/register tokens added; halt/value heads read position 0 (the first register token).
+- Both training scripts smoke-pass end-to-end (`--max-steps 2`).
+- `verify_datasets.py` — 84/84 paper-strict checks across all 4 cache files.
+- `verify_solutions_exhaustive.py` — every one of 618 020 cached solutions across the four datasets is a true constraint-satisfying answer (rows/cols/diagonals distinct for N-Queens; no monochrome edges and canonical color labels for Graph Coloring).
+- Stochastic guidance verified active (two model(x) calls on the same input give mean-abs-diff 0.44 ≠ 0).
+
+## File index
+
+```
+gram_model.py                 GRAM module (encoder, recursive core, decoder, stochastic guidance, EMA, ACT halt head, LPRM value head)
+data_nqueens.py               N-Queens generator, dataset, metric, validity checker
+data_graph_coloring.py        Graph Coloring generator, dataset, metric, conflict/coverage helpers
+prepare_data.py               Materialize all four cache files (.pt + metadata.json + summary.txt)
+analyze_data.py               Solution-count histograms (Figure 10/12 inputs)
+train_paper.py                Train GRAM on N-Queens (--n 8 or 10)
+train_graph_coloring.py       Train GRAM on Graph Coloring (--n 8 or 10)
+eval_paper.py                 Paper-style evaluation: acc@1, coverage@N for N in {1,5,10,20}, bucketed by # solutions
+verify_datasets.py            Paper-strict dataset checks (84 assertions)
+verify_solutions_exhaustive.py  Brute-force solution validity over every cached answer (~600K solutions)
+plot_results.py               Training curves + figures via SciencePlots
+smoke_test.py                 Tiny model+forward shape test
+data_cache/                   Materialized .pt files + summary.txt + analysis/
+```
+
+## Known remaining unknowns
+
+The paper does not state the Graph Coloring edge probability, AdamW betas, or the auxiliary loss weights for the halt/LPRM heads. Defaults are exposed as CLI flags (`--p-edge`, `--halt-weight`, `--lprm-weight`). If the authors release an official implementation, swap these in.

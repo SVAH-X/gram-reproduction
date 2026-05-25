@@ -1,0 +1,20 @@
+graph_coloring n=10
+  file: data_cache/graphcolor_n10_p0.4_seed0.pt
+  train/test solution range: 1..864 / 1..384
+  train hist csv: data_cache/analysis/graphcolor_n10_train_solution_hist.csv
+  test hist csv : data_cache/analysis/graphcolor_n10_test_solution_hist.csv
+graph_coloring n=8
+  file: data_cache/graphcolor_n8_p0.4_seed0.pt
+  train/test solution range: 1..324 / 1..216
+  train hist csv: data_cache/analysis/graphcolor_n8_train_solution_hist.csv
+  test hist csv : data_cache/analysis/graphcolor_n8_test_solution_hist.csv
+nqueens n=10
+  file: data_cache/nqueens_n10_seed0.pt
+  train/test solution range: 1..93 / 1..69
+  train hist csv: data_cache/analysis/nqueens_n10_train_solution_hist.csv
+  test hist csv : data_cache/analysis/nqueens_n10_test_solution_hist.csv
+nqueens n=8
+  file: data_cache/nqueens_n8_seed0.pt
+  train/test solution range: 1..18 / 1..16
+  train hist csv: data_cache/analysis/nqueens_n8_train_solution_hist.csv
+  test hist csv : data_cache/analysis/nqueens_n8_test_solution_hist.csv

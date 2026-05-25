@@ -1,0 +1,42 @@
+data_cache/nqueens_n8_seed0.pt
+  seq_len: 64
+  unique_train_inputs: 4375
+  unique_test_inputs: 773
+  train_target_pairs: 7206
+  test_target_pairs: 1258
+  dataset_batches_per_pass: 10
+  paper_trajectory_batches: 3000
+  segment_updates_per_trajectory: 16
+  paper_training_steps: 48000
+  sha256: 2d54e4cdfa359138385c8b410a8079b84557adcae56311b66eb1c465d52a1867
+data_cache/nqueens_n10_seed0.pt
+  seq_len: 100
+  unique_train_inputs: 36907
+  unique_test_inputs: 6513
+  train_target_pairs: 108153
+  test_target_pairs: 18547
+  dataset_batches_per_pass: 141
+  paper_trajectory_batches: 1000
+  segment_updates_per_trajectory: 16
+  paper_training_steps: 16000
+  sha256: e3ec8597778a327567cb80e8a9986bce1dca883cc42bc920763dd7adf81df579
+data_cache/graphcolor_n8_p0.4_seed0.pt
+  input_seq_len: 28
+  target_seq_len: 8
+  train_graphs: 7002
+  test_graphs: 255
+  dataset_batches_per_pass: 10
+  paper_trajectory_batches: 5000
+  segment_updates_per_trajectory: 16
+  paper_training_steps: 80000
+  sha256: 3b6d0ac0a9135437f93d4c047ec58c0b9ace88d46d8be4a6972283b1f048ba9c
+data_cache/graphcolor_n10_p0.4_seed0.pt
+  input_seq_len: 45
+  target_seq_len: 10
+  train_graphs: 13465
+  test_graphs: 192
+  dataset_batches_per_pass: 18
+  paper_trajectory_batches: 5000
+  segment_updates_per_trajectory: 16
+  paper_training_steps: 80000
+  sha256: 0e17e1df7a3147a869e4e76de58e4e306acececbcfa89bcaa70b1d279292fb70
