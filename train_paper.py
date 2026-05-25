@@ -72,7 +72,9 @@ def evaluate(model, batcher, batch_size, device, N_best=20, use_ema=False, ema=N
 
 def main():
     ap = argparse.ArgumentParser()
-    # Paper hparams — defaults match arXiv:2605.19376 N-Queens 8x8.
+    # Paper hparams — defaults match arXiv:2605.19376.
+    ap.add_argument("--n",          type=int, default=8,
+                    help="N-Queens board size (8 or 10). seq_len auto-set to n*n.")
     ap.add_argument("--b-per-step", type=int, default=64,
                     help="per-forward batch (raise to fit your VRAM)")
     ap.add_argument("--accum",      type=int, default=12,
@@ -82,7 +84,8 @@ def main():
     ap.add_argument("--warmup",     type=int, default=1_000)
     ap.add_argument("--lr",         type=float, default=1e-4)        # ✓ paper
     ap.add_argument("--wd",         type=float, default=1.0)         # ✓ paper
-    ap.add_argument("--beta",       type=float, default=0.07)        # ✓ paper N-Queens 8x8
+    ap.add_argument("--beta",       type=float, default=None,
+                    help="KL weight. If unset, paper Table values used: 0.07 (n=8), 0.045 (n=10).")
     ap.add_argument("--kl-balance", type=float, default=0.8)         # ✓ paper (Dreamer)
     ap.add_argument("--ema-decay",  type=float, default=0.9999)      # ✓ paper
     ap.add_argument("--halt-weight",type=float, default=0.5)         # ⚠ guess
@@ -90,10 +93,21 @@ def main():
     ap.add_argument("--log-every",  type=int, default=200)
     ap.add_argument("--eval-every", type=int, default=2_000)
     ap.add_argument("--ckpt-every", type=int, default=5_000)
-    ap.add_argument("--out-prefix", type=str, default="gram_paper")
+    ap.add_argument("--out-prefix", type=str, default=None,
+                    help="Default: gram_paper_n{n}")
     ap.add_argument("--seed",       type=int, default=0)
     ap.add_argument("--device",     type=str, default=None)
     args = ap.parse_args()
+
+    # Per-task defaults (paper Table)
+    PAPER_BETA = {8: 0.07, 10: 0.045}
+    if args.beta is None:
+        if args.n not in PAPER_BETA:
+            raise ValueError(f"--n={args.n}: paper only specifies n=8 (β=0.07) and n=10 (β=0.045). "
+                             f"Pass --beta explicitly for other sizes.")
+        args.beta = PAPER_BETA[args.n]
+    if args.out_prefix is None:
+        args.out_prefix = f"gram_paper_n{args.n}"
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -103,13 +117,14 @@ def main():
     torch.manual_seed(args.seed)
 
     cfg = GRAMConfig(                            # ✓ all values match paper
-        vocab_size=3, seq_len=64,
+        vocab_size=3, seq_len=args.n * args.n,
         d_model=512, n_heads=8, ffn_hidden=512, n_layers=2,
         K=4, T=3, N_sup=16,
         use_attn=True, use_rope=True, use_halt=True,
     )
     model = GRAM(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
+    print(f"task             : N-Queens {args.n}x{args.n}  (seq_len {cfg.seq_len}, β {args.beta})")
     print(f"params           : {n_params/1e6:.2f}M")
     print(f"transitions/step : N_sup * T = {cfg.N_sup * cfg.T}")
 
@@ -117,7 +132,7 @@ def main():
     opt = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd,
                 betas=(0.9, 0.95))               # ⚠ betas guessed; paper unspecified
 
-    batcher = NQueensBatcher(n=8)
+    batcher = NQueensBatcher(n=args.n)
     print(f"n-queens solutions: {batcher.num_solutions()}")
 
     target_batch = args.b_per_step * args.accum

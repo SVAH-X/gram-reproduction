@@ -74,10 +74,11 @@ pip install -r requirements.txt          # only torch + nbformat
 jupyter notebook gram_paper.ipynb        # or upload to JupyterHub / Colab
 
 # Option B — pure Python (preferred for headless servers / nohup / tmux)
-python train_paper.py                                    # 30k steps, batch 64*12=768
-python train_paper.py --b-per-step 128 --accum 6         # if you have 24+ GB VRAM
+python train_paper.py                                    # N-Queens 8x8, 30k steps, batch 64*12=768
+python train_paper.py --n 10                             # N-Queens 10x10 (β=0.045 auto-selected)
+python train_paper.py --b-per-step 128 --accum 6         # 24+ GB VRAM
 python train_paper.py --steps 50000 --out-prefix run2    # longer run, separate output
-nohup python train_paper.py > paper_train.out 2>&1 &     # detached run
+nohup python train_paper.py --n 10 > paper_n10.out 2>&1 &  # detached n=10 run
 ```
 
 Both paths print loss/recon/KL/halt/LPRM every 200 steps and a full eval (best-of-1, best-of-20, halt) every 2,000 steps for both raw and EMA weights. Checkpoints land in `gram_paper_step{N}.pt` every 5,000 steps.
@@ -88,7 +89,13 @@ Wall-clock estimate: paper reports ~1 h on 8×4090 for N-Queens 8×8. With grad 
 
 ## Pass criteria
 
-Paper-reported numbers on N-Queens 8×8: **99.7% acc / 90.3% cov**. Reproduction targets:
+Paper-reported numbers (Table 2):
+- **N-Queens 8×8: 99.7% acc / 90.3% cov**  (β=0.07)
+- **N-Queens 10×10: 89.7% acc / 57.5% cov** (β=0.045)
+- Graph Coloring N=8: 2.7 conflict edges (β=0.5)  *— task not yet implemented*
+- Graph Coloring N=10: 3.3 conflict edges (β=0.45) *— task not yet implemented*
+
+Reproduction targets for N-Queens (`train_paper.py --n 8` / `--n 10`):
 
 - **EMA best-of-1 full_token > 0.99** (= paper "acc")
 - **EMA best-of-20 full_board > 0.85** (≈ paper "cov" = best-of-N coverage)
