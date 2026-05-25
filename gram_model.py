@@ -170,15 +170,33 @@ class RecursiveModule(nn.Module):
 # ---------------------------------------------------------- guidance / heads
 
 class StochasticGuidance(nn.Module):
-    """Diagonal Gaussian head — mu and log_var via separate SwiGLUs."""
-    def __init__(self, cfg: GRAMConfig, log_var_min=-10.0, log_var_max=2.0):
+    """Diagonal Gaussian head — mu and log_var via separate SwiGLUs.
+
+    Two construction modes:
+      * d_in = D    : prior path. Input is u.
+      * d_in = 2*D  : posterior path. Input is concat([u, e_y]).
+                      Replaces the original additive `u + e_y` conditioning,
+                      which let the posterior shortcut around u by encoding
+                      the answer as a giant additive shift (μ_q drifted to ±40
+                      while μ_p stayed near 0, killing the prior's gradient).
+    A tanh*mu_scale bound on μ also blocks the runaway: posterior can no
+    longer trivially memorize y via unbounded shifts.
+    """
+    def __init__(self, cfg: GRAMConfig, d_in: Optional[int] = None,
+                 log_var_min=-10.0, log_var_max=2.0, mu_scale: float = 4.0):
         super().__init__()
-        self.mu_net      = SwiGLU(cfg.d_model, cfg.ffn_hidden, cfg.d_model)
-        self.logvar_net  = SwiGLU(cfg.d_model, cfg.ffn_hidden, cfg.d_model)
+        d_in = d_in or cfg.d_model
+        self.mu_net      = SwiGLU(d_in, cfg.ffn_hidden, cfg.d_model)
+        self.logvar_net  = SwiGLU(d_in, cfg.ffn_hidden, cfg.d_model)
         self.lv_min, self.lv_max = log_var_min, log_var_max
+        self.mu_scale = mu_scale
 
     def params(self, x):
-        mu      = self.mu_net(x)
+        # tanh-bounded μ prevents the |mu_q| → 40 runaway that decoupled
+        # posterior from prior. mu_scale=4 is loose enough that signal is
+        # plenty for prediction but tight enough that posterior can't
+        # encode the answer as an unbounded shift.
+        mu      = self.mu_scale * torch.tanh(self.mu_net(x) / self.mu_scale)
         log_var = self.logvar_net(x).clamp(self.lv_min, self.lv_max)
         return mu, log_var
 
@@ -291,8 +309,14 @@ class GRAM(nn.Module):
         self.token_embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
         # Paper B.1: 16 prepended puzzle/register tokens, shared across the
         # batch and learned. The halt and value heads read position 0.
+        # Init at the post-scaling magnitude of content tokens. Content tokens
+        # use the default nn.Embedding init N(0, 1) which we then scale by
+        # sqrt(D) in `encode`, so their per-element std is sqrt(D). Initing
+        # puzzle_embed at N(0, sqrt(D)²) keeps both streams on the same scale.
+        # The previous N(0, 0.02²) init left puzzle tokens ~1000× too small
+        # and the halt/value heads (which read h[:, 0]) saw near-zero input.
         self.puzzle_embed = nn.Parameter(
-            torch.randn(1, cfg.num_puzzle_tokens, cfg.d_model) * 0.02
+            torch.randn(1, cfg.num_puzzle_tokens, cfg.d_model) * math.sqrt(cfg.d_model)
         )
         # learned pos embed only used when RoPE is off
         if not cfg.use_rope:
@@ -300,8 +324,10 @@ class GRAM(nn.Module):
 
         self.f_L           = RecursiveModule(cfg)
         self.f_H           = RecursiveModule(cfg)
-        self.guidance      = StochasticGuidance(cfg)   # prior  p_theta(eps|u)
-        self.guidance_post = StochasticGuidance(cfg)   # posterior q_phi(eps|u,e_y)
+        self.guidance      = StochasticGuidance(cfg, d_in=cfg.d_model)
+        # Posterior receives concat([u, e_y]); see StochasticGuidance docstring
+        # for why additive conditioning was broken.
+        self.guidance_post = StochasticGuidance(cfg, d_in=2 * cfg.d_model)
 
         self.norm_out  = RMSNorm(cfg.d_model)
         # Paper Table 4: Linear(D -> vocab).
@@ -369,7 +395,7 @@ class GRAM(nn.Module):
     def transition_train(self, h_prev, l_prev, e_x, e_y):
         u, l = self._propose(h_prev, l_prev, e_x)
         mu_p, lv_p = self.guidance.params(u)
-        mu_q, lv_q = self.guidance_post.params(u + e_y)
+        mu_q, lv_q = self.guidance_post.params(torch.cat([u, e_y], dim=-1))
         eps = mu_q + (0.5 * lv_q).exp() * torch.randn_like(mu_q)
         return u + eps, l, (mu_p, lv_p), (mu_q, lv_q)
 
@@ -424,6 +450,15 @@ class GRAM(nn.Module):
         kl = kl_balance * kl_prior_grad + (1.0 - kl_balance) * kl_post_grad
         elbo_loss = recon + beta * kl
 
+        # True symmetric KL — what we actually care about for diagnosis.
+        # The `kl` above is gradient-shaped (one half is detached on each side
+        # for KL-balancing) and can read as ~0.01 while the actual posterior
+        # has drifted to |μ_q| ~ 40, which we caught only by direct inspection.
+        with torch.no_grad():
+            kl_true = kl_gaussian(mu_q, lv_q, mu_p, lv_p).mean()
+            mu_p_std = mu_p.std()
+            mu_q_std = mu_q.std()
+
         with torch.no_grad():
             pred = logits.argmax(-1)
             correct = pred == y_ids
@@ -453,6 +488,9 @@ class GRAM(nn.Module):
             "loss": loss.item(),
             "recon": recon.item(),
             "kl": kl.item(),
+            "kl_true": kl_true.item(),
+            "mu_p_std": mu_p_std.item(),
+            "mu_q_std": mu_q_std.item(),
             "lprm": lprm_loss.item(),
             "halt": halt_loss.item() if self.cfg.use_halt else 0.0,
             "r": target.mean().item(),
@@ -623,6 +661,9 @@ class GRAM(nn.Module):
             "loss":  loss.item(),
             "recon": recon_avg.item(),
             "kl":    kl_avg.item(),
+            "kl_true": 0.0,    # legacy path; segment-level training reports real value
+            "mu_p_std": 0.0,
+            "mu_q_std": 0.0,
             "lprm":  lprm_loss.item(),
             "halt":  halt_avg.item() if self.cfg.use_halt else 0.0,
             "r":     r.mean().item(),

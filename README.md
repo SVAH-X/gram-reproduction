@@ -99,7 +99,7 @@ Figures are written to `data_cache/analysis/figs/`.
 
 ## What's been verified before launch
 
-- Model architecture re-derived from paper Appendix B; param count 10.51 M (paper says ~10 M).
+- Model architecture re-derived from paper Appendix B; param count **11.55 M** (paper says ~10 M; we are slightly over because we replaced the paper's underspecified additive posterior conditioning `u + e_y` with `posterior_net(concat([u, e_y]))` after the additive form was empirically broken — see CHANGELOG).
 - 16 prepended puzzle/register tokens added; halt/value heads read position 0 (the first register token).
 - Both training scripts smoke-pass end-to-end (`--max-steps 2`).
 - `verify_datasets.py` — 84/84 paper-strict checks across all 4 cache files.

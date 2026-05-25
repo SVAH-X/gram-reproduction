@@ -216,7 +216,9 @@ def main():
                 for group in opt.param_groups:
                     group["lr"] = args.lr * lr_scale(global_step)
                 opt.zero_grad(set_to_none=True)
-                info_accum = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "lprm": 0.0, "halt": 0.0, "r": 0.0, "acc": 0.0}
+                info_accum = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "kl_true": 0.0,
+                              "mu_p_std": 0.0, "mu_q_std": 0.0,
+                              "lprm": 0.0, "halt": 0.0, "r": 0.0, "acc": 0.0}
                 next_states = []
 
                 for mi, start in enumerate(range(0, batch_actual, args.b_per_step)):
@@ -252,7 +254,9 @@ def main():
                         f"traj {trajectory:5d}/{args.epochs} seg {segment:2d}/{cfg.N_sup} "
                         f"step {global_step:7d}/{total_steps} | "
                         f"loss {info_accum['loss']:.4f} recon {info_accum['recon']:.4f} "
-                        f"kl {info_accum['kl']:.4f} halt {info_accum['halt']:.4f} "
+                        f"kl {info_accum['kl']:.4f} kl_true {info_accum['kl_true']:.3f} "
+                        f"mp {info_accum['mu_p_std']:.3f} mq {info_accum['mu_q_std']:.3f} "
+                        f"halt {info_accum['halt']:.4f} "
                         f"lprm {info_accum['lprm']:.4f} r {info_accum['r']:.3f} "
                         f"acc {info_accum['acc']:.3f} gn {grad_norm.item():.2f} "
                         f"t {time.time() - t0:.1f}s"

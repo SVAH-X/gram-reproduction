@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.pt
 *.log
+*.out
 .ipynb_checkpoints/
 .DS_Store
 # Reference PDFs (large; copyrighted; reproducible from arXiv)
