@@ -14,14 +14,26 @@ The model implements:
 
 ## Files
 
+### Model + data (always loaded)
 | file | what |
 | --- | --- |
 | `gram_model.py` | Model definition. Module is named `gram_model` (not `gram`) because the PyPI `gram` package shadows the import. |
 | `data_nqueens.py` | Enumerates all 92 N-Queens 8×8 solutions, masks at p∈[0.3,0.8] |
-| `gram_paper.ipynb` | Paper-scale training notebook for GPU. Just open and run top-to-bottom. |
-| `train_nqueens.py` | Small-scale CLI training script (D=128) — for laptop sanity checks. |
-| `train_smoke.py` | Phase-2 synthetic smoke test — verify ELBO machinery. |
-| `smoke_test.py` | Phase-1 forward-pass shape test. |
+
+### Paper-scale training (use either, they are equivalent)
+| file | what |
+| --- | --- |
+| `gram_paper.ipynb` | Paper-scale Jupyter notebook. D=512, K=4, T=3, N_sup=16, batch=768, lr=1e-4, wd=1.0, EMA=0.9999, 30k steps. |
+| `train_paper.py`   | Same config as above, pure Python script (`python train_paper.py`). All hparams overridable via CLI flags. |
+
+### Laptop validation (small config — NOT paper-scale)
+| file | what | typical runtime |
+| --- | --- | --- |
+| `smoke_test.py`     | Phase-1 forward-pass shape test. D=128, no training. | seconds |
+| `train_smoke.py`    | Phase-2 synthetic ELBO check (y = reverse(x)). D=128, β=0.3, 600 steps. | ~1 min |
+| `train_nqueens.py`  | Phase-3a small N-Queens validation. D=128, β=0.1, 1000 steps. **Will not reach paper numbers** — it's intentionally tiny so it finishes on a MacBook. | ~90 s on MPS |
+
+The laptop scripts use **lr=1e-3, wd=0.01, batch=32, no EMA, no RoPE, no halt** because at D=128 paper hparams over-regularize the small model. They are scaffolding to verify the math; they are not the experiment.
 
 ## Hyperparameter alignment with paper
 
@@ -54,13 +66,21 @@ The ⚠️ rows are the parameters most likely to need tuning. If the paper code
 ## Quickstart on a remote GPU
 
 ```bash
-git clone https://github.com/<your-username>/gram-reproduction.git
+git clone https://github.com/SVAH-X/gram-reproduction.git
 cd gram-reproduction
 pip install -r requirements.txt          # only torch + nbformat
+
+# Option A — Jupyter notebook
 jupyter notebook gram_paper.ipynb        # or upload to JupyterHub / Colab
+
+# Option B — pure Python (preferred for headless servers / nohup / tmux)
+python train_paper.py                                    # 30k steps, batch 64*12=768
+python train_paper.py --b-per-step 128 --accum 6         # if you have 24+ GB VRAM
+python train_paper.py --steps 50000 --out-prefix run2    # longer run, separate output
+nohup python train_paper.py > paper_train.out 2>&1 &     # detached run
 ```
 
-Then run cells top-to-bottom. The training cell prints loss/recon/KL/halt/LPRM every 200 steps and a full eval (best-of-1, best-of-20, halt) every 2,000 steps for both raw and EMA weights. Checkpoints land in `gram_paper_step{N}.pt` every 5,000 steps.
+Both paths print loss/recon/KL/halt/LPRM every 200 steps and a full eval (best-of-1, best-of-20, halt) every 2,000 steps for both raw and EMA weights. Checkpoints land in `gram_paper_step{N}.pt` every 5,000 steps.
 
 VRAM budget: at `B_per_step=64`, D=512 the model fits in ~10–12 GB. To match paper batch=768 we use gradient accumulation `accum_steps=12` (so `64 × 12 = 768`). If your card has more VRAM, raise `B_per_step` and lower `accum_steps` proportionally — the effective batch must stay 768.
 
