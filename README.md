@@ -23,30 +23,33 @@ The model implements:
 | `train_smoke.py` | Phase-2 synthetic smoke test — verify ELBO machinery. |
 | `smoke_test.py` | Phase-1 forward-pass shape test. |
 
-## Paper-scale hyperparameters
+## Hyperparameter alignment with paper
 
-These are baked into `gram_paper.ipynb` (`GRAMConfig` + the training cell):
+| symbol | paper | this repo | confidence |
+| --- | --- | --- | --- |
+| D (d_model) | 512 | 512 | ✓ paper |
+| heads | 8 | 8 | ✓ paper |
+| FFN hidden | 512 | 512 | ✓ paper |
+| f_L, f_H layers | 2 each | 2 each | ✓ paper |
+| K (inner loop) — N-Queens | 4 | 4 | ✓ paper |
+| T (transitions/step) | 3 | 3 | ✓ paper |
+| N_sup (sup. steps) | 16 | 16 | ✓ paper |
+| β (KL weight) — N-Queens 8×8 | 0.07 | 0.07 | ✓ paper |
+| KL balance α | 0.8 (Dreamer) | 0.8 | ✓ paper |
+| AdamW lr | 1e-4 | 1e-4 | ✓ paper |
+| AdamW wd | 1.0 | 1.0 | ✓ paper |
+| grad clip | 1.0 | 1.0 | ✓ paper |
+| EMA decay | 0.9999 | 0.9999 | ✓ paper |
+| **batch size (global)** | **768** (8×4090) | **768** (B=64 × accum=12) | ✓ matched via grad accum |
+| Halt threshold σ(q^halt)>0.5 | 0.5 | 0.5 | ✓ paper |
+| RoPE θ | not specified | 10000 | ⚠️ standard default |
+| AdamW betas | not specified in our notes | (0.9, 0.95) | ⚠️ guess (modern-LLM default) |
+| Warmup schedule | not specified in our notes | 1000-step linear | ⚠️ guess |
+| halt loss weight | not specified in our notes | 0.5 | ⚠️ guess |
+| LPRM loss weight | not specified in our notes | 1.0 | ⚠️ guess |
+| Training length | "3000 epochs" (paper) | 30,000 optimizer steps ≈ 23M effective samples | ⚠️ epoch→step conversion ambiguous; tune if not converged |
 
-| symbol | value | where |
-| --- | --- | --- |
-| D (d_model) | 512 | `GRAMConfig.d_model` |
-| heads | 8 | `GRAMConfig.n_heads` |
-| FFN hidden | 512 | `GRAMConfig.ffn_hidden` |
-| f_L, f_H layers | 2 each | `GRAMConfig.n_layers` |
-| K (inner loop) | 4 | `GRAMConfig.K` |
-| T (transitions/step) | 3 | `GRAMConfig.T` |
-| N_sup (sup. steps) | 16 | `GRAMConfig.N_sup` |
-| total transitions | 48 | K is *per* transition |
-| β (KL weight) | 0.07 | training cell |
-| KL balance α | 0.8 | training cell |
-| optimizer | AdamW(0.9, 0.95) | training cell |
-| learning rate | 1e-4 (1k step warmup) | training cell |
-| weight decay | 1.0 | training cell |
-| EMA decay | 0.9999 | model+EMA cell |
-| LPRM weight | 1.0 | `train_step` |
-| halt weight | 0.5 | `train_step` |
-| batch size | 128 | training cell (bump if VRAM allows) |
-| total steps | 50,000 | training cell |
+The ⚠️ rows are the parameters most likely to need tuning. If the paper code drops, prefer those values over my guesses.
 
 ## Quickstart on a remote GPU
 
@@ -59,17 +62,19 @@ jupyter notebook gram_paper.ipynb        # or upload to JupyterHub / Colab
 
 Then run cells top-to-bottom. The training cell prints loss/recon/KL/halt/LPRM every 200 steps and a full eval (best-of-1, best-of-20, halt) every 2,000 steps for both raw and EMA weights. Checkpoints land in `gram_paper_step{N}.pt` every 5,000 steps.
 
-VRAM budget: at B=128, D=512 the model fits in ~16 GB. On a 24 GB card you can push to B=256 for ~2× throughput.
+VRAM budget: at `B_per_step=64`, D=512 the model fits in ~10–12 GB. To match paper batch=768 we use gradient accumulation `accum_steps=12` (so `64 × 12 = 768`). If your card has more VRAM, raise `B_per_step` and lower `accum_steps` proportionally — the effective batch must stay 768.
 
-Wall-clock estimate: ~4–6 hours on a single A100, ~8–12 hours on a 4090.
+Wall-clock estimate: paper reports ~1 h on 8×4090 for N-Queens 8×8. With grad accum on a single GPU expect roughly **8× longer per effective batch** plus arithmetic for the smaller per-step batch — budget ~12–24 h on a single A100/4090, longer on weaker cards.
 
 ## Pass criteria
 
-Per the paper Table 2 and our Phase 4 small-scale experiments:
+Paper-reported numbers on N-Queens 8×8: **99.7% acc / 90.3% cov**. Reproduction targets:
 
-- **EMA best-of-1 full_token > 0.99**
-- **EMA best-of-20 full_board ≫ EMA best-of-1 full_board**  ← the LPRM payoff
+- **EMA best-of-1 full_token > 0.99** (= paper "acc")
+- **EMA best-of-20 full_board > 0.85** (≈ paper "cov" = best-of-N coverage)
 - **Halt avg_steps < N_sup** when full_board is high — model has learned to stop early
+- corr(score, reward) > 0.7 — LPRM is informative
+- distinct preds / 20 samples > 5 — prior has not collapsed
 
 ## Critical implementation note
 
