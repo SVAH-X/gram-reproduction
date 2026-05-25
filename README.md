@@ -20,11 +20,15 @@ The model implements:
 | `gram_model.py` | Model definition. Module is named `gram_model` (not `gram`) because the PyPI `gram` package shadows the import. |
 | `data_nqueens.py` | Enumerates all 92 N-Queens 8×8 solutions, masks at p∈[0.3,0.8] |
 
-### Paper-scale training (use either, they are equivalent)
-| file | what |
-| --- | --- |
-| `gram_paper.ipynb` | Paper-scale Jupyter notebook. D=512, K=4, T=3, N_sup=16, batch=768, lr=1e-4, wd=1.0, EMA=0.9999, 30k steps. |
-| `train_paper.py`   | Same config as above, pure Python script (`python train_paper.py`). All hparams overridable via CLI flags. |
+### Paper-scale training
+| file | task | β default | how to run |
+| --- | --- | --- | --- |
+| `gram_paper.ipynb`         | N-Queens 8×8 (Jupyter) | 0.07 | open in JupyterLab |
+| `train_paper.py`           | N-Queens 8×8 / 10×10   | auto: 0.07 / 0.045 | `python train_paper.py --n 8` |
+| `train_graph_coloring.py`  | Graph 3-Coloring N=8/10 | auto: 0.5 / 0.45 | `python train_graph_coloring.py --n 8` |
+| `data_graph_coloring.py`   | shared by graph coloring training | — | imported |
+
+All three use the same `gram_model.GRAM` with the same architecture (D=512, K=4, T=3, N_sup=16) and the same optimizer / EMA / LPRM / halt machinery. They differ only in data + β.
 
 ### Laptop validation (small config — NOT paper-scale)
 | file | what | typical runtime |
@@ -76,9 +80,10 @@ jupyter notebook gram_paper.ipynb        # or upload to JupyterHub / Colab
 # Option B — pure Python (preferred for headless servers / nohup / tmux)
 python train_paper.py                                    # N-Queens 8x8, 30k steps, batch 64*12=768
 python train_paper.py --n 10                             # N-Queens 10x10 (β=0.045 auto-selected)
+python train_graph_coloring.py --n 8                     # Graph 3-coloring N=8 (β=0.5 auto)
+python train_graph_coloring.py --n 10                    # Graph 3-coloring N=10 (β=0.45 auto)
 python train_paper.py --b-per-step 128 --accum 6         # 24+ GB VRAM
-python train_paper.py --steps 50000 --out-prefix run2    # longer run, separate output
-nohup python train_paper.py --n 10 > paper_n10.out 2>&1 &  # detached n=10 run
+nohup python train_paper.py --n 10 > paper_n10.out 2>&1 &  # detached run
 ```
 
 Both paths print loss/recon/KL/halt/LPRM every 200 steps and a full eval (best-of-1, best-of-20, halt) every 2,000 steps for both raw and EMA weights. Checkpoints land in `gram_paper_step{N}.pt` every 5,000 steps.
@@ -92,8 +97,8 @@ Wall-clock estimate: paper reports ~1 h on 8×4090 for N-Queens 8×8. With grad 
 Paper-reported numbers (Table 2):
 - **N-Queens 8×8: 99.7% acc / 90.3% cov**  (β=0.07)
 - **N-Queens 10×10: 89.7% acc / 57.5% cov** (β=0.045)
-- Graph Coloring N=8: 2.7 conflict edges (β=0.5)  *— task not yet implemented*
-- Graph Coloring N=10: 3.3 conflict edges (β=0.45) *— task not yet implemented*
+- **Graph Coloring N=8: 2.7 conflict edges**  (β=0.5)
+- **Graph Coloring N=10: 3.3 conflict edges** (β=0.45)
 
 Reproduction targets for N-Queens (`train_paper.py --n 8` / `--n 10`):
 

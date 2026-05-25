@@ -375,12 +375,20 @@ class GRAM(nn.Module):
     def train_step(self, x_ids, y_ids, beta: float = 0.07,
                    kl_balance: float = 0.8,
                    lprm_weight: float = 1.0,
-                   halt_weight: float = 0.5):
+                   halt_weight: float = 0.5,
+                   y_mask: Optional[torch.Tensor] = None):
+        """y_mask: optional bool (B, S). When provided, recon CE is computed
+        only at True positions, and halt-target / acc / LPRM-target are
+        per-example correctness over True positions only. Used for graph
+        coloring where adjacency tokens are input-only. y_ids must contain
+        valid token ids everywhere (the posterior embedding e_y reads it)."""
         B = x_ids.shape[0]
         e_x = self.encode(x_ids)
         e_y = self.encode(y_ids)
         h = self.h0.expand(B, -1, -1).contiguous()
         l = self.l0.expand(B, -1, -1).contiguous()
+
+        n_valid = y_mask.float().sum(-1).clamp(min=1.0) if y_mask is not None else None
 
         recon_sum = 0.0
         kl_sum    = 0.0
@@ -394,10 +402,18 @@ class GRAM(nn.Module):
             h, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
 
             logits = self.lm_head(self.norm_out(h))
-            recon  = F.cross_entropy(
-                logits.reshape(-1, self.cfg.vocab_size),
-                y_ids.reshape(-1),
-            )
+            if y_mask is None:
+                recon = F.cross_entropy(
+                    logits.reshape(-1, self.cfg.vocab_size),
+                    y_ids.reshape(-1),
+                )
+            else:
+                y_for_loss = y_ids.masked_fill(~y_mask, -100)
+                recon = F.cross_entropy(
+                    logits.reshape(-1, self.cfg.vocab_size),
+                    y_for_loss.reshape(-1),
+                    ignore_index=-100,
+                )
             kl_post_grad  = kl_gaussian(mu_q, lv_q,
                                         mu_p.detach(), lv_p.detach()).mean()
             kl_prior_grad = kl_gaussian(mu_q.detach(), lv_q.detach(),
@@ -408,15 +424,24 @@ class GRAM(nn.Module):
             kl_sum    = kl_sum    + kl
 
             if self.cfg.use_halt:
-                # target: per-example correctness rate, BCE
+                # target: per-example correctness rate over valid positions
                 with torch.no_grad():
-                    target = (logits.argmax(-1) == y_ids).float().mean(dim=-1)
+                    correct = (logits.argmax(-1) == y_ids)
+                    if y_mask is None:
+                        target = correct.float().mean(dim=-1)
+                    else:
+                        target = (correct & y_mask).float().sum(-1) / n_valid
                 halt_logit = self.halt_head(h)
                 halt = F.binary_cross_entropy_with_logits(halt_logit, target)
                 halt_sum = halt_sum + halt
 
             with torch.no_grad():
-                acc_sum += (logits.argmax(-1) == y_ids).float().mean().item()
+                correct = (logits.argmax(-1) == y_ids)
+                if y_mask is None:
+                    acc_sum += correct.float().mean().item()
+                else:
+                    acc_sum += ((correct & y_mask).float().sum()
+                                / y_mask.float().sum().clamp(min=1)).item()
 
             h = h.detach()
             l = l.detach()
@@ -432,7 +457,11 @@ class GRAM(nn.Module):
         h_prior_T = self._run_prior_trajectory(e_x)
         with torch.no_grad():
             logits_p = self.lm_head(self.norm_out(h_prior_T))
-            r = (logits_p.argmax(-1) == y_ids).float().mean(dim=-1)
+            correct_p = (logits_p.argmax(-1) == y_ids)
+            if y_mask is None:
+                r = correct_p.float().mean(dim=-1)
+            else:
+                r = (correct_p & y_mask).float().sum(-1) / n_valid
         score = self.value_head(h_prior_T)
         lprm_loss = F.mse_loss(score, r)
 
