@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 from gram_model import GRAM, GRAMConfig
-from data_nqueens import nqueens_accuracy, nqueens_coverage
+from data_nqueens import QUEEN, nqueens_accuracy, nqueens_coverage, nqueens_diagnostics
 from data_graph_coloring import (
     COLOR_BASE,
     NUM_COLORS,
@@ -30,7 +30,7 @@ from data_graph_coloring import (
 SAMPLE_COUNTS = (1, 5, 10, 20)
 
 
-def load_model(args, payload):
+def _fallback_config(args):
     if args.task == "nqueens":
         cfg = GRAMConfig(
             vocab_size=3,
@@ -62,16 +62,23 @@ def load_model(args, payload):
             use_rope=True,
             use_halt=True,
         )
+    return cfg
 
+
+def load_model(args, payload):
+    ckpt = torch.load(args.checkpoint, map_location="cpu") if args.checkpoint else None
+    if ckpt is not None and "cfg" in ckpt:
+        cfg = GRAMConfig(**ckpt["cfg"])
+    else:
+        cfg = _fallback_config(args)
     model = GRAM(cfg)
-    if args.checkpoint:
-        ckpt = torch.load(args.checkpoint, map_location="cpu")
-        model.load_state_dict(ckpt["model"], strict=False)
+    if ckpt is not None:
+        model.load_state_dict(ckpt["model"], strict=True)
         state = ckpt.get("ema", {}).get("shadow") if args.use_ema and "ema" in ckpt else None
         if state:
             merged = model.state_dict()
             merged.update(state)
-            model.load_state_dict(merged, strict=False)
+            model.load_state_dict(merged, strict=True)
     model.to(args.device)
     model.eval()
     return model
@@ -94,20 +101,32 @@ def eval_nqueens(args, payload):
     completions_all = [payload["completions"][tuple(x.tolist())] for x in x_all]
     rows = []
     bucket_rows = defaultdict(lambda: {f"coverage@{n}": [] for n in SAMPLE_COUNTS} | {"acc@1": []})
+    queen_sum = 0.0
+    keep_sum = 0.0
+    given_sum = 0.0
+    diag_sum = {"exact_n": 0.0, "rows_ok": 0.0, "cols_ok": 0.0, "diag_ok": 0.0, "valid_tokens": 0.0}
 
     for start in range(0, x_all.shape[0], args.batch_size):
         x = x_all[start : start + args.batch_size].to(args.device)
         completions = completions_all[start : start + args.batch_size]
         samples = sample_model(model, x, max(SAMPLE_COUNTS))
-        acc1 = nqueens_accuracy(samples[:, 0], x.cpu(), args.n)
+        pred1 = samples[:, 0]
+        x_cpu = x.cpu()
+        acc1 = nqueens_accuracy(pred1, x_cpu, args.n)
+        diag = nqueens_diagnostics(pred1, x_cpu, args.n)
+        for key, value in diag.items():
+            diag_sum[key] += value * x.shape[0]
+        queen_sum += (pred1 == QUEEN).sum().item()
+        keep_sum += ((x_cpu == QUEEN) & (pred1 == QUEEN)).sum().item()
+        given_sum += (x_cpu == QUEEN).sum().item()
         metrics = {"acc@1": acc1}
         for n_samples in SAMPLE_COUNTS:
-            metrics[f"coverage@{n_samples}"] = nqueens_coverage(samples[:, :n_samples], x.cpu(), completions, args.n)
+            metrics[f"coverage@{n_samples}"] = nqueens_coverage(samples[:, :n_samples], x_cpu, completions, args.n)
         rows.append(metrics | {"count": x.shape[0]})
 
         for i, valid in enumerate(completions):
             b = len(valid)
-            xi = x[i : i + 1].cpu()
+            xi = x_cpu[i : i + 1]
             si = samples[i : i + 1]
             bucket_rows[b]["acc@1"].append(nqueens_accuracy(si[:, 0], xi, args.n))
             for n_samples in SAMPLE_COUNTS:
@@ -117,6 +136,10 @@ def eval_nqueens(args, payload):
     overall = {"task": "nqueens", "n": args.n, "num_examples": total}
     for key in ["acc@1"] + [f"coverage@{n}" for n in SAMPLE_COUNTS]:
         overall[key] = sum(r[key] * r["count"] for r in rows) / max(total, 1)
+    overall["avg_queens@1"] = queen_sum / max(total, 1)
+    overall["given_keep@1"] = keep_sum / max(given_sum, 1)
+    for key, value in diag_sum.items():
+        overall[f"{key}@1"] = value / max(total, 1)
 
     buckets = []
     for b, vals in sorted(bucket_rows.items()):

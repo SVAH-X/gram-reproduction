@@ -327,7 +327,7 @@ def main():
                         f"mp {info_accum['mu_p_std']:.3f} mq {info_accum['mu_q_std']:.3f} "
                         f"halt {info_accum['halt']:.4f} "
                         f"lprm {info_accum['lprm']:.4f} r {info_accum['r']:.3f} "
-                        f"acc_p {info_accum['acc']:.3f} acc_q {info_accum['acc_q']:.3f} "
+                        f"acc_p_on_q_state {info_accum['acc']:.3f} acc_q {info_accum['acc_q']:.3f} "
                         f"gn {grad_norm.item():.2f} t {time.time() - t0:.1f}s"
                     )
                     print(msg)

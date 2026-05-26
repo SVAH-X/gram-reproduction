@@ -32,6 +32,7 @@ from data_nqueens import (
     load_nqueens_cache,
     nqueens_accuracy,
     nqueens_coverage,
+    nqueens_diagnostics,
     steps_per_epoch,
 )
 
@@ -94,6 +95,7 @@ def evaluate(model, eval_set, batch_size, device, samples=20, max_examples=None,
     queen_sum = 0.0
     keep_sum = 0.0
     given_sum = 0.0
+    diag_sum = {"exact_n": 0.0, "rows_ok": 0.0, "cols_ok": 0.0, "diag_ok": 0.0, "valid_tokens": 0.0}
     with ctx:
         for x, completions in eval_set.batches(batch_size, max_examples=max_examples):
             x = x.to(device)
@@ -101,6 +103,9 @@ def evaluate(model, eval_set, batch_size, device, samples=20, max_examples=None,
             pred = logits.argmax(-1)
             bsz = x.shape[0]
             acc_sum += nqueens_accuracy(pred, x, eval_set.n) * bsz
+            diag = nqueens_diagnostics(pred, x, eval_set.n)
+            for key, value in diag.items():
+                diag_sum[key] += value * bsz
             queen_sum += (pred == QUEEN).sum().item()
             keep_sum += ((x == QUEEN) & (pred == QUEEN)).sum().item()
             given_sum += (x == QUEEN).sum().item()
@@ -116,6 +121,11 @@ def evaluate(model, eval_set, batch_size, device, samples=20, max_examples=None,
         "coverage": cov_sum / max(total, 1),
         "avg_queens": queen_sum / max(total, 1),
         "given_keep": keep_sum / max(given_sum, 1),
+        "exact_n": diag_sum["exact_n"] / max(total, 1),
+        "rows_ok": diag_sum["rows_ok"] / max(total, 1),
+        "cols_ok": diag_sum["cols_ok"] / max(total, 1),
+        "diag_ok": diag_sum["diag_ok"] / max(total, 1),
+        "valid_tokens": diag_sum["valid_tokens"] / max(total, 1),
         "n_eval": total,
     }
 
@@ -331,7 +341,7 @@ def main():
                         f"mp {info_accum['mu_p_std']:.3f} mq {info_accum['mu_q_std']:.3f} "
                         f"halt {info_accum['halt']:.4f} "
                         f"lprm {info_accum['lprm']:.4f} r {info_accum['r']:.3f} "
-                        f"acc_p {info_accum['acc']:.3f} acc_q {info_accum['acc_q']:.3f} "
+                        f"acc_p_on_q_state {info_accum['acc']:.3f} acc_q {info_accum['acc_q']:.3f} "
                         f"gn {grad_norm.item():.2f} t {time.time() - t0:.1f}s"
                     )
                     print(msg)
@@ -354,7 +364,9 @@ def main():
                         line = (
                             f"  >> {tag:3s} test n={ev['n_eval']} "
                             f"acc {ev['accuracy']:.4f} coverage@{args.coverage_samples} {ev['coverage']:.4f} "
-                            f"avg_q {ev['avg_queens']:.2f}/{args.n} keep {ev['given_keep']:.3f}"
+                            f"avg_q {ev['avg_queens']:.2f}/{args.n} keep {ev['given_keep']:.3f} "
+                            f"exact{args.n} {ev['exact_n']:.3f} row {ev['rows_ok']:.3f} "
+                            f"col {ev['cols_ok']:.3f} diag {ev['diag_ok']:.3f}"
                         )
                         print(line)
                         logf.write(line + "\n")

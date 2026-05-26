@@ -65,7 +65,7 @@ _LOG_LINE_NEW = re.compile(
     r"halt\s+(?P<halt>[-\d.eE]+)\s+"
     r"lprm\s+(?P<lprm>[-\d.eE]+)\s+"
     r"r\s+(?P<r>[-\d.eE]+)\s+"
-    r"acc_p\s+(?P<acc>[-\d.eE]+)\s+"
+    r"(?:acc_p_on_q_state|acc_p)\s+(?P<acc>[-\d.eE]+)\s+"
     r"acc_q\s+(?P<acc_q>[-\d.eE]+)\s+"
     r"gn\s+(?P<gn>[-\d.eE]+)"
 )
@@ -77,7 +77,7 @@ _LOG_LINE_POSTERIOR = re.compile(
     r"halt\s+(?P<halt>[-\d.eE]+)\s+"
     r"lprm\s+(?P<lprm>[-\d.eE]+)\s+"
     r"r\s+(?P<r>[-\d.eE]+)\s+"
-    r"acc_p\s+(?P<acc>[-\d.eE]+)\s+"
+    r"(?:acc_p_on_q_state|acc_p)\s+(?P<acc>[-\d.eE]+)\s+"
     r"acc_q\s+(?P<acc_q>[-\d.eE]+)\s+"
     r"gn\s+(?P<gn>[-\d.eE]+)"
 )
@@ -131,7 +131,7 @@ def plot_curves(log_path: Path, out_dir: Path) -> None:
         ("loss",  "loss"),
         ("recon", "reconstruction NLL"),
         ("kl",    "KL(q || p)"),
-        ("acc",   "train per-position accuracy"),
+        ("acc",   "p-on-q-state token acc"),
     ]
     for ax, (key, ylab) in zip(axes.flat, panels):
         xs, ys = zip(*train[key])

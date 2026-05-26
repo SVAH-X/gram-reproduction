@@ -290,6 +290,24 @@ def graph_coverage(samples: torch.Tensor, colorings: List[Tuple[Coloring, ...]],
     total = 0.0
     for preds, valid_sols in zip(samples_l, colorings):
         valid_set = set(valid_sols)
-        found = {tuple(pred) for pred in preds if tuple(pred) in valid_set}
+        found = {
+            canonicalize_coloring(pred)
+            for pred in preds
+            if canonicalize_coloring(pred) in valid_set
+        }
         total += len(found) / max(len(valid_set), 1)
     return total / max(len(colorings), 1)
+
+
+def canonicalize_coloring(colors: Sequence[int]) -> Coloring:
+    """Canonicalize a predicted coloring up to color-label permutation."""
+    mapping: Dict[int, int] = {}
+    out: List[int] = []
+    next_color = 0
+    for color in colors:
+        c = int(color)
+        if c not in mapping:
+            mapping[c] = next_color
+            next_color += 1
+        out.append(mapping[c])
+    return tuple(out)

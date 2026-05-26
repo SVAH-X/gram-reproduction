@@ -572,7 +572,9 @@ class GRAM(nn.Module):
             "lprm": lprm_loss.item(),
             "halt": halt_loss.item() if self.cfg.use_halt else 0.0,
             "r": target.mean().item(),
-            "acc": acc_p.item(),         # prior diagnostic
+            # Prior sample from the current posterior-conditioned proposal
+            # state. This is NOT full prior-rollout eval accuracy.
+            "acc": acc_p.item(),
             "acc_q": acc_q.item(),       # posterior train accuracy
         }, h_q.detach(), l.detach()
 
@@ -637,14 +639,22 @@ class GRAM(nn.Module):
         n_steps[not_halted] = self.cfg.N_sup
         return self.decode(h_final), n_steps
 
-    def train_step(self, x_ids, y_ids, beta: float = 0.07,
-                   kl_balance: float = 0.8,
-                   kl_reduction: str = "mean",
-                   free_nats: float = 0.0,
-                   lprm_weight: float = 1.0,
-                   halt_weight: float = 0.5,
-                   y_mask: Optional[torch.Tensor] = None):
-        """Train one batch with optional target masking.
+    def train_step(self, *args, **kwargs):
+        raise RuntimeError(
+            "GRAM.train_step() is deprecated and intentionally disabled. "
+            "Use train_supervision_segment() through train_paper.py or "
+            "train_graph_coloring.py so each supervision segment gets its own "
+            "optimizer step and diagnostics are comparable to eval."
+        )
+
+    def train_step_deprecated_do_not_use(self, x_ids, y_ids, beta: float = 0.07,
+                                         kl_balance: float = 0.8,
+                                         kl_reduction: str = "mean",
+                                         free_nats: float = 0.0,
+                                         lprm_weight: float = 1.0,
+                                         halt_weight: float = 0.5,
+                                         y_mask: Optional[torch.Tensor] = None):
+        """Deprecated legacy full-trajectory training helper.
 
         x_ids has shape (B, input_seq_len). y_ids has shape
         (B, target_seq_len), where target_seq_len may differ from input_seq_len.

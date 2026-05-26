@@ -19,7 +19,7 @@ python analyze_data.py --data-dir data_cache
 
 ## Training on the 4×A100 server
 
-`train_paper.py` and `train_graph_coloring.py` are single-process training scripts. They use bf16 autocast on CUDA and gradient accumulation to reach the paper's global batch size of 768 on **one** GPU. To use all four A100s, launch four runs in parallel on the four task / size combinations:
+`train_paper.py` and `train_graph_coloring.py` are the supported training entrypoints. They use bf16 autocast on CUDA and gradient accumulation to reach the paper's global batch size of 768 on **one** GPU. To use all four A100s, launch four runs in parallel on the four task / size combinations:
 
 ```bash
 # pin each task to its own GPU
@@ -40,7 +40,7 @@ python eval_paper.py --task graphcolor --n 8  --checkpoint gram_graphcolor_n8_fi
 python eval_paper.py --task graphcolor --n 10 --checkpoint gram_graphcolor_n10_final.pt --use-ema --batch-size 64
 ```
 
-Outputs go to `data_cache/analysis/eval_*.json` and `eval_*.buckets.csv`.
+`eval_paper.py` reconstructs the model from the checkpoint's saved `cfg`, so ablations such as `--num-puzzle-tokens 0/16` are evaluated with the same architecture that was trained. Outputs go to `data_cache/analysis/eval_*.json` and `eval_*.buckets.csv`.
 
 ## How epochs / steps are designed (paper-strict)
 
@@ -68,7 +68,7 @@ Paper-stated knobs and controlled ablations already wired in:
 - **EMA decay = 0.9999** (applied every optimizer step; eval uses EMA weights when `--use-ema` is set).
 - **KL balance β_bal = 0.8** (Appendix B.2).
 - **β (KL weight) per task**: 0.07 / 0.045 / 0.5 / 0.45 for NQ-8 / NQ-10 / GC-8 / GC-10 (auto-selected, override with `--beta`).
-- **Posterior rollout for training**: segment trajectories sample from `q(eps | u, y)`; the reconstruction loss is on the posterior terminal state, while the prior learns through balanced KL. Prior-path accuracy is logged as a diagnostic only.
+- **Posterior rollout for training**: segment trajectories sample from `q(eps | u, y)`; the reconstruction loss is on the posterior terminal state, while the prior learns through balanced KL. `acc_p_on_q_state` is only a local diagnostic from a posterior-conditioned proposal state; the `>> raw/EMA test` lines are the true full-prior rollout metrics.
 - **N-Queens CE weighting**: defaults to paper-faithful unweighted CE (`--queen-loss-weight 1.0`). Use `--queen-loss-weight auto` only as an explicit imbalance ablation.
 - **KL reduction ablation**: `--kl-reduction mean` by default; `sum` and `sum_d_mean_l` are available because the paper does not specify the reduction axes. Logs include both `km` (per-element mean KL) and `ks` (sum over latent axes) for scale diagnostics.
 - **Puzzle/register-token ablation**: task scripts default to `--num-puzzle-tokens 0`; pass `--num-puzzle-tokens 16` to test the Appendix-B.1/register-token reading.
@@ -81,9 +81,9 @@ Paper-stated knobs and controlled ablations already wired in:
 Both training scripts log every 5 optimizer steps by default:
 
 ```
-traj  123/3000 seg  7/16 step    1979/48000 | loss 0.4187 recon 0.1284 kl 1.43 kl_true 1.43 km 0.0123 ks 403.2 mp 1.21 mq 1.67 halt 0.04 lprm 0.001 r 0.973 acc_p 0.984 acc_q 0.998 gn 0.61 t 412.3s
-  >> raw test n=512 acc 0.9821 coverage@20 0.7864 avg_q 7.96/8 keep 0.997
-  >> EMA test n=512 acc 0.9893 coverage@20 0.8194 avg_q 7.99/8 keep 0.999
+traj  123/3000 seg  7/16 step    1979/48000 | loss 0.4187 recon 0.1284 kl 1.43 kl_true 1.43 km 0.0123 ks 403.2 mp 1.21 mq 1.67 halt 0.04 lprm 0.001 r 0.973 acc_p_on_q_state 0.984 acc_q 0.998 gn 0.61 t 412.3s
+  >> raw test n=512 acc 0.9821 coverage@20 0.7864 avg_q 7.96/8 keep 0.997 exact8 0.984 row 0.990 col 0.988 diag 0.984
+  >> EMA test n=512 acc 0.9893 coverage@20 0.8194 avg_q 7.99/8 keep 0.999 exact8 0.990 row 0.994 col 0.992 diag 0.989
 ```
 
 Eval rolls every 1000 steps by default (`--eval-every`). To tail a run:
@@ -105,7 +105,7 @@ Figures are written to `data_cache/analysis/figs/`.
 ## What's been verified before launch
 
 - Model architecture re-derived from paper Appendix B; param count **~11.55 M** with explicit `posterior_net(concat([u, e_y]))` conditioning. Task scripts can run with 0 or 16 puzzle/register tokens.
-- Posterior-rollout segment training smoke-passes end-to-end; prior-path metrics are logged for train/eval mismatch diagnosis.
+- Posterior-rollout segment training smoke-passes end-to-end; `acc_p_on_q_state` is explicitly labeled as local, and periodic eval reports full-prior N-Queens validity breakdown (`avg_q`, `exactN`, row/col/diag checks).
 - Both training scripts smoke-pass end-to-end (`--max-steps 2`).
 - `verify_datasets.py` — 84/84 paper-strict checks across all 4 cache files.
 - `verify_solutions_exhaustive.py` — every one of 618 020 cached solutions across the four datasets is a true constraint-satisfying answer (rows/cols/diagonals distinct for N-Queens; no monochrome edges and canonical color labels for Graph Coloring).

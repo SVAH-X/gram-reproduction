@@ -240,6 +240,47 @@ def nqueens_accuracy(pred: torch.Tensor, x: torch.Tensor, n: int) -> float:
     return correct / max(len(pred_l), 1)
 
 
+def nqueens_diagnostics(pred: torch.Tensor, x: torch.Tensor, n: int) -> Dict[str, float]:
+    """Full-prior N-Queens validity breakdown for debugging zero accuracy."""
+    pred_l = pred.detach().cpu().tolist()
+    x_l = x.detach().cpu().tolist()
+    total = max(len(pred_l), 1)
+    out = {
+        "exact_n": 0,
+        "rows_ok": 0,
+        "cols_ok": 0,
+        "diag_ok": 0,
+        "valid_tokens": 0,
+    }
+    for p, partial in zip(pred_l, x_l):
+        if len(p) != n * n:
+            continue
+        valid_tokens = True
+        queens: List[Tuple[int, int]] = []
+        for idx, token in enumerate(p):
+            if token not in (EMPTY, QUEEN):
+                valid_tokens = False
+                break
+            if partial[idx] == QUEEN and token != QUEEN:
+                valid_tokens = False
+                break
+            if token == QUEEN:
+                queens.append((idx // n, idx % n))
+        if not valid_tokens:
+            continue
+        out["valid_tokens"] += 1
+        rows = {r for r, _ in queens}
+        cols = {c for _, c in queens}
+        diag1 = {r - c for r, c in queens}
+        diag2 = {r + c for r, c in queens}
+        exact_n = len(queens) == n
+        out["exact_n"] += int(exact_n)
+        out["rows_ok"] += int(exact_n and len(rows) == n)
+        out["cols_ok"] += int(exact_n and len(cols) == n)
+        out["diag_ok"] += int(exact_n and len(diag1) == n and len(diag2) == n)
+    return {k: v / total for k, v in out.items()}
+
+
 def nqueens_coverage(samples: torch.Tensor, x: torch.Tensor, completions: List[Tuple[Board, ...]], n: int) -> float:
     """samples: (B, S, L) predicted token ids."""
     total = 0.0
