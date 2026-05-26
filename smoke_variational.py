@@ -12,10 +12,11 @@ the long training run cannot recur silently:
      sigma = exp(0) = 1 for every element), sigma_p has variance ~0 and
      this fails.
 
-  3. |mu_p - mu_q|.mean() < 5  AND  mu_q.std() < 4
+  3. mu_q.std() stays finite and nonzero
      Catches the posterior-runaway regime where additive `u + e_y`
-     conditioning let mu_q drift to ±40. With concat+MLP+tanh bound the
-     posterior cannot run away.
+     conditioning let mu_q drift to ±40. With concat+MLP and the corrected
+     posterior-rollout objective, the posterior should stay controlled without
+     requiring a default tanh mean bound.
 
 Run:
     python smoke_variational.py

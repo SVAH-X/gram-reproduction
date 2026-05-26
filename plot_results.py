@@ -69,6 +69,18 @@ _LOG_LINE_NEW = re.compile(
     r"acc_q\s+(?P<acc_q>[-\d.eE]+)\s+"
     r"gn\s+(?P<gn>[-\d.eE]+)"
 )
+_LOG_LINE_POSTERIOR = re.compile(
+    r"step\s+(?P<step>\d+)/\d+\s*\|\s*"
+    r"loss\s+(?P<loss>[-\d.eE]+)\s+"
+    r"recon\s+(?P<recon>[-\d.eE]+)\s+"
+    r"kl\s+(?P<kl>[-\d.eE]+).*?"
+    r"halt\s+(?P<halt>[-\d.eE]+)\s+"
+    r"lprm\s+(?P<lprm>[-\d.eE]+)\s+"
+    r"r\s+(?P<r>[-\d.eE]+)\s+"
+    r"acc_p\s+(?P<acc>[-\d.eE]+)\s+"
+    r"acc_q\s+(?P<acc_q>[-\d.eE]+)\s+"
+    r"gn\s+(?P<gn>[-\d.eE]+)"
+)
 _EVAL_LINE = re.compile(
     r">>\s*(?P<tag>raw|EMA)\s+test\s+n=(?P<n>\d+)\s+"
     r"(?:acc\s+(?P<acc>[-\d.eE]+)|conflicts\s+(?P<conflict>[-\d.eE]+))\s+"
@@ -83,7 +95,7 @@ def parse_log(path: Path):
     last_step = 0
     with path.open() as f:
         for line in f:
-            m = _LOG_LINE_NEW.search(line) or _LOG_LINE_OLD.search(line)
+            m = _LOG_LINE_POSTERIOR.search(line) or _LOG_LINE_NEW.search(line) or _LOG_LINE_OLD.search(line)
             if m:
                 step = int(m["step"])
                 last_step = step

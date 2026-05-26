@@ -128,6 +128,11 @@ def main():
     ap.add_argument("--decay-all", action="store_true", help="Apply AdamW weight decay to every parameter. Default excludes embeddings/norms/biases/registers.")
     ap.add_argument("--beta", type=float, default=None)
     ap.add_argument("--kl-balance", type=float, default=0.8)
+    ap.add_argument("--kl-reduction", choices=["mean", "sum", "sum_d_mean_l"], default="mean", help="How to reduce elementwise KL before applying beta.")
+    ap.add_argument("--free-nats", type=float, default=0.0, help="Optional free-nats floor after the selected KL reduction; default off.")
+    ap.add_argument("--num-puzzle-tokens", type=int, default=0, help="Default keeps puzzle embeddings off for this task; use 16 as an ablation.")
+    ap.add_argument("--mu-scale", type=float, default=0.0, help="Optional tanh bound for Gaussian means; <=0 leaves means unbounded.")
+    ap.add_argument("--sigma-floor", type=float, default=0.0, help="Optional minimum sigma for Gaussian heads; default off.")
     ap.add_argument("--ema-decay", type=float, default=0.9999)
     ap.add_argument("--halt-weight", type=float, default=1.0)
     ap.add_argument("--lprm-weight", type=float, default=1.0)
@@ -198,6 +203,9 @@ def main():
         use_attn=True,
         use_rope=True,
         use_halt=True,
+        num_puzzle_tokens=args.num_puzzle_tokens,
+        guidance_mu_scale=(args.mu_scale if args.mu_scale > 0 else None),
+        sigma_floor=args.sigma_floor,
     )
     model = GRAM(cfg).to(device)
     ema = EMA(model, decay=args.ema_decay)
@@ -205,6 +213,7 @@ def main():
     opt = AdamW(opt_params, lr=args.lr, weight_decay=args.wd if args.decay_all else 0.0)
     planned_steps = args.epochs * cfg.N_sup
     total_steps = min(planned_steps, args.max_steps) if args.max_steps else planned_steps
+    mu_scale_label = "unbounded" if args.mu_scale <= 0 else f"{args.mu_scale:g}"
 
     out_prefix = args.out_prefix or f"gram_graphcolor_n{args.n}"
     print(f"device           : {device}")
@@ -223,6 +232,11 @@ def main():
     print(f"planned training steps    : {planned_steps}")
     print(f"running training steps    : {total_steps}")
     print(f"beta             : {args.beta}")
+    print(f"kl reduction     : {args.kl_reduction}")
+    print(f"free nats        : {args.free_nats:g}")
+    print(f"puzzle/register tokens    : {args.num_puzzle_tokens}")
+    print(f"mu scale                  : {mu_scale_label}")
+    print(f"sigma floor               : {args.sigma_floor:g}")
     print(f"weight decay scope        : {'all params' if args.decay_all else 'matrix weights only'}")
 
     loader_gen = torch.Generator().manual_seed(args.seed)
@@ -267,7 +281,7 @@ def main():
                     group["lr"] = args.lr * lr_scale(global_step)
                 opt.zero_grad(set_to_none=True)
                 info_accum = {"loss": 0.0, "recon": 0.0, "recon_p": 0.0, "recon_q": 0.0,
-                              "kl": 0.0, "kl_true": 0.0,
+                              "kl": 0.0, "kl_true": 0.0, "kl_mean": 0.0, "kl_sum": 0.0,
                               "mu_p_std": 0.0, "mu_q_std": 0.0,
                               "lprm": 0.0, "halt": 0.0, "r": 0.0, "acc": 0.0, "acc_q": 0.0}
                 next_states = []
@@ -287,6 +301,8 @@ def main():
                             l=l,
                             beta=args.beta,
                             kl_balance=args.kl_balance,
+                            kl_reduction=args.kl_reduction,
+                            free_nats=args.free_nats,
                             lprm_weight=args.lprm_weight,
                             halt_weight=args.halt_weight,
                         )
@@ -305,8 +321,9 @@ def main():
                         f"traj {trajectory:5d}/{args.epochs} seg {segment:2d}/{cfg.N_sup} "
                         f"step {global_step:7d}/{total_steps} | "
                         f"loss {info_accum['loss']:.4f} "
-                        f"rp {info_accum['recon_p']:.4f} rq {info_accum['recon_q']:.4f} "
+                        f"recon {info_accum['recon']:.4f} "
                         f"kl {info_accum['kl']:.4f} kl_true {info_accum['kl_true']:.3f} "
+                        f"km {info_accum['kl_mean']:.4f} ks {info_accum['kl_sum']:.1f} "
                         f"mp {info_accum['mu_p_std']:.3f} mq {info_accum['mu_q_std']:.3f} "
                         f"halt {info_accum['halt']:.4f} "
                         f"lprm {info_accum['lprm']:.4f} r {info_accum['r']:.3f} "

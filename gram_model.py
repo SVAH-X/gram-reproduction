@@ -6,10 +6,12 @@ Paper: Baek, Jo, Kim, Ren, Bengio, Ahn — "Generative Recursive Reasoning"
 Per supervision step s in 0..N_sup-1:
     - K inner f_L iterations followed by f_H proposal -> u_t
     - eps_p ~ p_theta(eps | u), eps_q ~ q_phi(eps | u, e_y)
-    - decode both h_p = u_t + eps_p and h_q = u_t + eps_q during training
-    - cross-entropy reconstruction on the prior path, auxiliary posterior CE,
-      and balanced KL(q || p)
-    - halt_logit_t = q_head(h_p)         BCE against per-example correctness
+    - training rollout samples eps_q from the posterior, matching Eq. 13/14's
+      E_q reconstruction term; inference samples eps_p from the prior
+    - only the final transition of each supervision segment receives gradient
+    - cross-entropy reconstruction is on the posterior terminal state, and the
+      prior is trained through Dreamer-style balanced KL(q || p)
+    - halt_logit_t = q_head(h_q)         BCE against per-example correctness
 
 Final hidden h_T feeds value_head (LPRM) for best-of-N selection at inference.
 """
@@ -38,6 +40,10 @@ class GRAMConfig:
     use_rope:   bool = True
     use_halt:   bool = True
     rope_theta: float = 10000.0
+    # Optional ablation knobs. Defaults keep posterior means unbounded and
+    # preserve the current clamped-logvar parameterization.
+    guidance_mu_scale: Optional[float] = None
+    sigma_floor: float = 0.0
     # Paper B.1: "prepended with 16 puzzle embedding tokens".
     # HRM-style register tokens read by the halt/value heads via h[:,0].
     num_puzzle_tokens: int = 16
@@ -179,25 +185,30 @@ class StochasticGuidance(nn.Module):
                       which let the posterior shortcut around u by encoding
                       the answer as a giant additive shift (μ_q drifted to ±40
                       while μ_p stayed near 0, killing the prior's gradient).
-    A tanh*mu_scale bound on μ also blocks the runaway: posterior can no
-    longer trivially memorize y via unbounded shifts.
+
+    By default μ is unbounded, matching Dreamer/VRNN-style Gaussian heads.
+    Passing mu_scale enables the old tanh-bound as an explicit ablation.
     """
     def __init__(self, cfg: GRAMConfig, d_in: Optional[int] = None,
-                 log_var_min=-10.0, log_var_max=2.0, mu_scale: float = 4.0):
+                 log_var_min=-10.0, log_var_max=2.0,
+                 mu_scale: Optional[float] = None,
+                 sigma_floor: float = 0.0):
         super().__init__()
         d_in = d_in or cfg.d_model
         self.mu_net      = SwiGLU(d_in, cfg.ffn_hidden, cfg.d_model)
         self.logvar_net  = SwiGLU(d_in, cfg.ffn_hidden, cfg.d_model)
         self.lv_min, self.lv_max = log_var_min, log_var_max
         self.mu_scale = mu_scale
+        self.sigma_floor = sigma_floor
 
     def params(self, x):
-        # tanh-bounded μ prevents the |mu_q| → 40 runaway that decoupled
-        # posterior from prior. mu_scale=4 is loose enough that signal is
-        # plenty for prediction but tight enough that posterior can't
-        # encode the answer as an unbounded shift.
-        mu      = self.mu_scale * torch.tanh(self.mu_net(x) / self.mu_scale)
+        mu = self.mu_net(x)
+        if self.mu_scale is not None and self.mu_scale > 0:
+            mu = self.mu_scale * torch.tanh(mu / self.mu_scale)
         log_var = self.logvar_net(x).clamp(self.lv_min, self.lv_max)
+        if self.sigma_floor > 0:
+            sigma = (0.5 * log_var).exp().clamp_min(self.sigma_floor)
+            log_var = 2.0 * sigma.log()
         return mu, log_var
 
     def forward(self, x):
@@ -218,6 +229,28 @@ def kl_gaussian(mu_q, lv_q, mu_p, lv_p):
                   + (mu_p - mu_q).pow(2) / var_p
                   + lv_p - lv_q
                   - 1.0)
+
+
+def reduce_kl(kl_elem: torch.Tensor, mode: str = "mean", free_nats: float = 0.0):
+    """Reduce elementwise KL with an explicit, ablatable convention.
+
+    `kl_elem` has shape [B, L, D]. GRAM's paper does not specify whether beta
+    multiplies a mean-per-element KL or a sum over latent axes, so callers must
+    choose. We always return a batch mean after the requested per-example
+    reduction.
+    """
+    flat = kl_elem.float().flatten(1)
+    if mode == "mean":
+        per_ex = flat.mean(dim=1)
+    elif mode == "sum":
+        per_ex = flat.sum(dim=1)
+    elif mode == "sum_d_mean_l":
+        per_ex = kl_elem.float().sum(dim=-1).mean(dim=-1)
+    else:
+        raise ValueError(f"unknown kl_reduction mode: {mode}")
+    if free_nats and free_nats > 0:
+        per_ex = per_ex.clamp_min(float(free_nats))
+    return per_ex.mean()
 
 
 class ValueHead(nn.Module):
@@ -324,10 +357,20 @@ class GRAM(nn.Module):
 
         self.f_L           = RecursiveModule(cfg)
         self.f_H           = RecursiveModule(cfg)
-        self.guidance      = StochasticGuidance(cfg, d_in=cfg.d_model)
+        self.guidance      = StochasticGuidance(
+            cfg,
+            d_in=cfg.d_model,
+            mu_scale=cfg.guidance_mu_scale,
+            sigma_floor=cfg.sigma_floor,
+        )
         # Posterior receives concat([u, e_y]); see StochasticGuidance docstring
         # for why additive conditioning was broken.
-        self.guidance_post = StochasticGuidance(cfg, d_in=2 * cfg.d_model)
+        self.guidance_post = StochasticGuidance(
+            cfg,
+            d_in=2 * cfg.d_model,
+            mu_scale=cfg.guidance_mu_scale,
+            sigma_floor=cfg.sigma_floor,
+        )
 
         self.norm_out  = RMSNorm(cfg.d_model)
         # Paper Table 4: Linear(D -> vocab).
@@ -392,24 +435,22 @@ class GRAM(nn.Module):
         eps, mu, log_var = self.guidance(u)
         return u + eps, l, mu, log_var
 
-    def transition_train(self, h_prev, l_prev, e_x, e_y):
-        """Final transition of a supervision segment, evaluated under BOTH
-        prior and posterior. Returns the two candidate latent states.
+    def transition_posterior(self, h_prev, l_prev, e_x, e_y):
+        """Posterior transition used for training rollouts.
 
-        The training loop uses h_p (prior path) for the inter-segment
-        passthrough so the training trajectory matches the eval trajectory.
-        h_q is decoded only as an auxiliary supervisor for the posterior;
-        it is NOT propagated forward. This prevents the posterior shortcut
-        that previously let y info leak across segments via the h chain.
+        The returned `u` lets the training step decode an informational prior
+        sample from the same proposal state without putting prior CE into the
+        loss.
         """
         u, l = self._propose(h_prev, l_prev, e_x)
         mu_p, lv_p = self.guidance.params(u)
         mu_q, lv_q = self.guidance_post.params(torch.cat([u, e_y], dim=-1))
-        eps_p = mu_p + (0.5 * lv_p).exp() * torch.randn_like(mu_p)
         eps_q = mu_q + (0.5 * lv_q).exp() * torch.randn_like(mu_q)
-        h_p = u + eps_p
-        h_q = u + eps_q
-        return h_p, h_q, l, (mu_p, lv_p), (mu_q, lv_q)
+        return u + eps_q, l, (mu_p, lv_p), (mu_q, lv_q), u
+
+    def transition_train(self, h_prev, l_prev, e_x, e_y):
+        """Final posterior transition of a supervision segment."""
+        return self.transition_posterior(h_prev, l_prev, e_x, e_y)
 
     def initial_state(self, batch_size: int, device=None):
         device = device or self.h0.device
@@ -420,6 +461,8 @@ class GRAM(nn.Module):
     def train_supervision_segment(self, x_ids, y_ids, h=None, l=None,
                                   beta: float = 0.07,
                                   kl_balance: float = 0.8,
+                                  kl_reduction: str = "mean",
+                                  free_nats: float = 0.0,
                                   lprm_weight: float = 1.0,
                                   halt_weight: float = 0.5,
                                   y_mask: Optional[torch.Tensor] = None,
@@ -441,14 +484,16 @@ class GRAM(nn.Module):
 
         with torch.no_grad():
             for _ in range(self.cfg.T - 1):
-                h, l, _, _ = self.transition(h, l, e_x)
-        h_p, h_q, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
+                h, l, _, _, _ = self.transition_posterior(h, l, e_x, e_y)
+        h_q, l, (mu_p, lv_p), (mu_q, lv_q), u = self.transition_train(h, l, e_x, e_y)
 
-        # Decode both paths. recon on h_p trains the PRIOR end-to-end (this is
-        # the network used at eval). recon on h_q trains the posterior as a
-        # stronger co-supervisor. KL pulls the two distributions together.
-        logits_p = self.decode(h_p)
+        # Paper-faithful surrogate: reconstruction is under the posterior
+        # trajectory E_q[log p(y | z_T, x)]. A prior decode is computed only as a
+        # diagnostic, not as a training loss.
         logits_q = self.decode(h_q)
+        with torch.no_grad():
+            eps_p = mu_p + (0.5 * lv_p).exp() * torch.randn_like(mu_p)
+            logits_p = self.decode(u + eps_p)
 
         def _ce(logits):
             logp = F.log_softmax(logits, dim=-1)
@@ -462,75 +507,74 @@ class GRAM(nn.Module):
                 valid = valid * token_w[targets]
             return (nll * valid).sum() / valid.sum().clamp_min(1.0)
 
-        recon_p = _ce(logits_p)
-        recon_q = _ce(logits_q)
+        recon = _ce(logits_q)
 
-        kl_post_grad = kl_gaussian(mu_q, lv_q, mu_p.detach(), lv_p.detach()).mean()
-        kl_prior_grad = kl_gaussian(mu_q.detach(), lv_q.detach(), mu_p, lv_p).mean()
+        kl_post_elem = kl_gaussian(mu_q, lv_q, mu_p.detach(), lv_p.detach())
+        kl_prior_elem = kl_gaussian(mu_q.detach(), lv_q.detach(), mu_p, lv_p)
+        kl_post_grad = reduce_kl(kl_post_elem, kl_reduction, free_nats)
+        kl_prior_grad = reduce_kl(kl_prior_elem, kl_reduction, free_nats)
         kl = kl_balance * kl_prior_grad + (1.0 - kl_balance) * kl_post_grad
-        # recon_p drives the prior directly; recon_q anchors the posterior as
-        # a useful supervisor; KL keeps them aligned. Combined loss.
-        elbo_loss = recon_p + recon_q + beta * kl
+        elbo_loss = recon + beta * kl
 
         with torch.no_grad():
-            kl_true = kl_gaussian(mu_q, lv_q, mu_p, lv_p).mean()
+            kl_elem = kl_gaussian(mu_q, lv_q, mu_p, lv_p)
+            kl_true = reduce_kl(kl_elem, kl_reduction, free_nats=0.0)
+            kl_mean = reduce_kl(kl_elem, "mean", free_nats=0.0)
+            kl_sum_diag = reduce_kl(kl_elem, "sum", free_nats=0.0)
             mu_p_std = mu_p.std()
             mu_q_std = mu_q.std()
 
         with torch.no_grad():
-            # All training-time monitoring uses the PRIOR path (logits_p),
-            # which is what eval actually computes. Previously we monitored
-            # the posterior path and saw acc=1.000 while eval was 0.0.
-            pred = logits_p.argmax(-1)
-            correct = pred == y_ids
-            if y_mask is None:
-                target = correct.float().mean(dim=-1)
-                acc = target.mean()
-            else:
-                target = (correct & y_mask).float().sum(-1) / n_valid
-                acc = ((correct & y_mask).float().sum() / y_mask.float().sum().clamp(min=1)).detach()
-            # Track posterior acc separately so a healthy run shows posterior
-            # leading the prior, then prior catching up.
+            # Posterior accuracy follows the actual reconstruction term.
             pred_q = logits_q.argmax(-1)
             correct_q = pred_q == y_ids
             if y_mask is None:
-                acc_q = correct_q.float().mean()
+                target = correct_q.float().mean(dim=-1)
+                acc_q = target.mean()
             else:
+                target = (correct_q & y_mask).float().sum(-1) / n_valid
                 acc_q = ((correct_q & y_mask).float().sum() / y_mask.float().sum().clamp(min=1)).detach()
 
-        # Halt and value heads use the PRIOR-path h, since that is the h
-        # passed forward and the h the eval-time decoder sees.
+            # Prior accuracy is an eval-style diagnostic from the same proposal
+            # state. It is not used in the loss.
+            pred_p = logits_p.argmax(-1)
+            correct_p = pred_p == y_ids
+            if y_mask is None:
+                acc_p = correct_p.float().mean()
+            else:
+                acc_p = ((correct_p & y_mask).float().sum() / y_mask.float().sum().clamp(min=1)).detach()
+
+        # Halt and value heads use the posterior terminal state used by the
+        # segment objective.
         halt_loss = torch.tensor(0.0, device=elbo_loss.device)
         if self.cfg.use_halt:
-            halt_logits = self.halt_head(h_p.detach())
+            halt_logits = self.halt_head(h_q.detach())
             halt_loss = F.binary_cross_entropy_with_logits(halt_logits[:, 0], target)
 
-        score = self.value_head(h_p.detach())
+        score = self.value_head(h_q.detach())
         lprm_loss = F.mse_loss(score, target)
 
         loss = elbo_loss + lprm_weight * lprm_loss
         if self.cfg.use_halt:
             loss = loss + halt_weight * halt_loss
 
-        # CRITICAL: pass h_p forward, not h_q. This makes the inter-segment
-        # passthrough match eval — the previous design passed h_q forward and
-        # the model learned a shortcut where posterior smuggled y across
-        # segments via the h chain, leaving the prior unable to reproduce it.
         return loss, {
             "loss": loss.item(),
-            "recon": recon_p.item(),     # legacy key; this is now recon_p
-            "recon_p": recon_p.item(),
-            "recon_q": recon_q.item(),
+            "recon": recon.item(),
+            "recon_p": 0.0,              # diagnostic-only; no prior CE in loss
+            "recon_q": recon.item(),
             "kl": kl.item(),
             "kl_true": kl_true.item(),
+            "kl_mean": kl_mean.item(),
+            "kl_sum": kl_sum_diag.item(),
             "mu_p_std": mu_p_std.item(),
             "mu_q_std": mu_q_std.item(),
             "lprm": lprm_loss.item(),
             "halt": halt_loss.item() if self.cfg.use_halt else 0.0,
             "r": target.mean().item(),
-            "acc": acc.item(),           # prior acc — matches what eval measures
-            "acc_q": acc_q.item(),       # posterior acc — should be > acc early on
-        }, h_p.detach(), l.detach()
+            "acc": acc_p.item(),         # prior diagnostic
+            "acc_q": acc_q.item(),       # posterior train accuracy
+        }, h_q.detach(), l.detach()
 
     @torch.no_grad()
     def _run_prior_trajectory(self, e_x):
@@ -595,6 +639,8 @@ class GRAM(nn.Module):
 
     def train_step(self, x_ids, y_ids, beta: float = 0.07,
                    kl_balance: float = 0.8,
+                   kl_reduction: str = "mean",
+                   free_nats: float = 0.0,
                    lprm_weight: float = 1.0,
                    halt_weight: float = 0.5,
                    y_mask: Optional[torch.Tensor] = None):
@@ -621,11 +667,9 @@ class GRAM(nn.Module):
         for _ in range(self.cfg.N_sup):
             with torch.no_grad():
                 for _ in range(self.cfg.T - 1):
-                    h, l, _, _ = self.transition(h, l, e_x)
-            h_p, h_q, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
-            # Legacy path: train on the posterior decode to keep tests passing,
-            # but pass h_p forward to match the new segment-level training.
-            h = h_p
+                    h, l, _, _, _ = self.transition_posterior(h, l, e_x, e_y)
+            h_q, l, (mu_p, lv_p), (mu_q, lv_q), _ = self.transition_train(h, l, e_x, e_y)
+            h = h_q
             logits = self.decode(h_q)
             if y_mask is None:
                 recon = F.cross_entropy(
@@ -639,10 +683,16 @@ class GRAM(nn.Module):
                     y_for_loss.reshape(-1),
                     ignore_index=-100,
                 )
-            kl_post_grad  = kl_gaussian(mu_q, lv_q,
-                                        mu_p.detach(), lv_p.detach()).mean()
-            kl_prior_grad = kl_gaussian(mu_q.detach(), lv_q.detach(),
-                                        mu_p, lv_p).mean()
+            kl_post_grad  = reduce_kl(
+                kl_gaussian(mu_q, lv_q, mu_p.detach(), lv_p.detach()),
+                kl_reduction,
+                free_nats,
+            )
+            kl_prior_grad = reduce_kl(
+                kl_gaussian(mu_q.detach(), lv_q.detach(), mu_p, lv_p),
+                kl_reduction,
+                free_nats,
+            )
             kl = kl_balance * kl_prior_grad + (1.0 - kl_balance) * kl_post_grad
 
             recon_sum = recon_sum + recon
@@ -698,7 +748,9 @@ class GRAM(nn.Module):
             "loss":  loss.item(),
             "recon": recon_avg.item(),
             "kl":    kl_avg.item(),
-            "kl_true": 0.0,    # legacy path; segment-level training reports real value
+            "kl_true": kl_avg.item(),
+            "kl_mean": 0.0,
+            "kl_sum": 0.0,
             "mu_p_std": 0.0,
             "mu_q_std": 0.0,
             "lprm":  lprm_loss.item(),
