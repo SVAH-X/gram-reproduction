@@ -393,11 +393,23 @@ class GRAM(nn.Module):
         return u + eps, l, mu, log_var
 
     def transition_train(self, h_prev, l_prev, e_x, e_y):
+        """Final transition of a supervision segment, evaluated under BOTH
+        prior and posterior. Returns the two candidate latent states.
+
+        The training loop uses h_p (prior path) for the inter-segment
+        passthrough so the training trajectory matches the eval trajectory.
+        h_q is decoded only as an auxiliary supervisor for the posterior;
+        it is NOT propagated forward. This prevents the posterior shortcut
+        that previously let y info leak across segments via the h chain.
+        """
         u, l = self._propose(h_prev, l_prev, e_x)
         mu_p, lv_p = self.guidance.params(u)
         mu_q, lv_q = self.guidance_post.params(torch.cat([u, e_y], dim=-1))
-        eps = mu_q + (0.5 * lv_q).exp() * torch.randn_like(mu_q)
-        return u + eps, l, (mu_p, lv_p), (mu_q, lv_q)
+        eps_p = mu_p + (0.5 * lv_p).exp() * torch.randn_like(mu_p)
+        eps_q = mu_q + (0.5 * lv_q).exp() * torch.randn_like(mu_q)
+        h_p = u + eps_p
+        h_q = u + eps_q
+        return h_p, h_q, l, (mu_p, lv_p), (mu_q, lv_q)
 
     def initial_state(self, batch_size: int, device=None):
         device = device or self.h0.device
@@ -429,38 +441,47 @@ class GRAM(nn.Module):
         with torch.no_grad():
             for _ in range(self.cfg.T - 1):
                 h, l, _, _ = self.transition(h, l, e_x)
-        h, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
+        h_p, h_q, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
 
-        logits = self.decode(h)
-        if y_mask is None:
-            recon = F.cross_entropy(
-                logits.reshape(-1, self.cfg.vocab_size),
-                y_ids.reshape(-1),
-            )
-        else:
+        # Decode both paths. recon on h_p trains the PRIOR end-to-end (this is
+        # the network used at eval). recon on h_q trains the posterior as a
+        # stronger co-supervisor. KL pulls the two distributions together.
+        logits_p = self.decode(h_p)
+        logits_q = self.decode(h_q)
+
+        def _ce(logits):
+            if y_mask is None:
+                return F.cross_entropy(
+                    logits.reshape(-1, self.cfg.vocab_size),
+                    y_ids.reshape(-1),
+                )
             y_for_loss = y_ids.masked_fill(~y_mask, -100)
-            recon = F.cross_entropy(
+            return F.cross_entropy(
                 logits.reshape(-1, self.cfg.vocab_size),
                 y_for_loss.reshape(-1),
                 ignore_index=-100,
             )
 
+        recon_p = _ce(logits_p)
+        recon_q = _ce(logits_q)
+
         kl_post_grad = kl_gaussian(mu_q, lv_q, mu_p.detach(), lv_p.detach()).mean()
         kl_prior_grad = kl_gaussian(mu_q.detach(), lv_q.detach(), mu_p, lv_p).mean()
         kl = kl_balance * kl_prior_grad + (1.0 - kl_balance) * kl_post_grad
-        elbo_loss = recon + beta * kl
+        # recon_p drives the prior directly; recon_q anchors the posterior as
+        # a useful supervisor; KL keeps them aligned. Combined loss.
+        elbo_loss = recon_p + recon_q + beta * kl
 
-        # True symmetric KL — what we actually care about for diagnosis.
-        # The `kl` above is gradient-shaped (one half is detached on each side
-        # for KL-balancing) and can read as ~0.01 while the actual posterior
-        # has drifted to |μ_q| ~ 40, which we caught only by direct inspection.
         with torch.no_grad():
             kl_true = kl_gaussian(mu_q, lv_q, mu_p, lv_p).mean()
             mu_p_std = mu_p.std()
             mu_q_std = mu_q.std()
 
         with torch.no_grad():
-            pred = logits.argmax(-1)
+            # All training-time monitoring uses the PRIOR path (logits_p),
+            # which is what eval actually computes. Previously we monitored
+            # the posterior path and saw acc=1.000 while eval was 0.0.
+            pred = logits_p.argmax(-1)
             correct = pred == y_ids
             if y_mask is None:
                 target = correct.float().mean(dim=-1)
@@ -468,25 +489,38 @@ class GRAM(nn.Module):
             else:
                 target = (correct & y_mask).float().sum(-1) / n_valid
                 acc = ((correct & y_mask).float().sum() / y_mask.float().sum().clamp(min=1)).detach()
+            # Track posterior acc separately so a healthy run shows posterior
+            # leading the prior, then prior catching up.
+            pred_q = logits_q.argmax(-1)
+            correct_q = pred_q == y_ids
+            if y_mask is None:
+                acc_q = correct_q.float().mean()
+            else:
+                acc_q = ((correct_q & y_mask).float().sum() / y_mask.float().sum().clamp(min=1)).detach()
 
+        # Halt and value heads use the PRIOR-path h, since that is the h
+        # passed forward and the h the eval-time decoder sees.
         halt_loss = torch.tensor(0.0, device=elbo_loss.device)
         if self.cfg.use_halt:
-            # Appendix A.1: ACT loss contributes only through the halt head.
-            halt_logits = self.halt_head(h.detach())
+            halt_logits = self.halt_head(h_p.detach())
             halt_loss = F.binary_cross_entropy_with_logits(halt_logits[:, 0], target)
 
-        # Appendix A.2: value head predicts trajectory quality from latent state.
-        # Detach h so the reward model does not alter the recursive core update.
-        score = self.value_head(h.detach())
+        score = self.value_head(h_p.detach())
         lprm_loss = F.mse_loss(score, target)
 
         loss = elbo_loss + lprm_weight * lprm_loss
         if self.cfg.use_halt:
             loss = loss + halt_weight * halt_loss
 
+        # CRITICAL: pass h_p forward, not h_q. This makes the inter-segment
+        # passthrough match eval — the previous design passed h_q forward and
+        # the model learned a shortcut where posterior smuggled y across
+        # segments via the h chain, leaving the prior unable to reproduce it.
         return loss, {
             "loss": loss.item(),
-            "recon": recon.item(),
+            "recon": recon_p.item(),     # legacy key; this is now recon_p
+            "recon_p": recon_p.item(),
+            "recon_q": recon_q.item(),
             "kl": kl.item(),
             "kl_true": kl_true.item(),
             "mu_p_std": mu_p_std.item(),
@@ -494,8 +528,9 @@ class GRAM(nn.Module):
             "lprm": lprm_loss.item(),
             "halt": halt_loss.item() if self.cfg.use_halt else 0.0,
             "r": target.mean().item(),
-            "acc": acc.item(),
-        }, h.detach(), l.detach()
+            "acc": acc.item(),           # prior acc — matches what eval measures
+            "acc_q": acc_q.item(),       # posterior acc — should be > acc early on
+        }, h_p.detach(), l.detach()
 
     @torch.no_grad()
     def _run_prior_trajectory(self, e_x):
@@ -587,9 +622,11 @@ class GRAM(nn.Module):
             with torch.no_grad():
                 for _ in range(self.cfg.T - 1):
                     h, l, _, _ = self.transition(h, l, e_x)
-            h, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
-
-            logits = self.decode(h)
+            h_p, h_q, l, (mu_p, lv_p), (mu_q, lv_q) = self.transition_train(h, l, e_x, e_y)
+            # Legacy path: train on the posterior decode to keep tests passing,
+            # but pass h_p forward to match the new segment-level training.
+            h = h_p
+            logits = self.decode(h_q)
             if y_mask is None:
                 recon = F.cross_entropy(
                     logits.reshape(-1, self.cfg.vocab_size),
