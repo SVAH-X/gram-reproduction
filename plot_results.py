@@ -45,7 +45,7 @@ def apply_style() -> None:
 
 # --------------------------------------------------------------- training log
 
-_LOG_LINE = re.compile(
+_LOG_LINE_OLD = re.compile(
     r"step\s+(?P<step>\d+)/\d+\s*\|\s*"
     r"loss\s+(?P<loss>[-\d.eE]+)\s+"
     r"recon\s+(?P<recon>[-\d.eE]+)\s+"
@@ -54,6 +54,19 @@ _LOG_LINE = re.compile(
     r"lprm\s+(?P<lprm>[-\d.eE]+)\s+"
     r"r\s+(?P<r>[-\d.eE]+)\s+"
     r"acc\s+(?P<acc>[-\d.eE]+)\s+"
+    r"gn\s+(?P<gn>[-\d.eE]+)"
+)
+_LOG_LINE_NEW = re.compile(
+    r"step\s+(?P<step>\d+)/\d+\s*\|\s*"
+    r"loss\s+(?P<loss>[-\d.eE]+)\s+"
+    r"rp\s+(?P<recon>[-\d.eE]+)\s+"
+    r"rq\s+(?P<recon_q>[-\d.eE]+)\s+"
+    r"kl\s+(?P<kl>[-\d.eE]+).*?"
+    r"halt\s+(?P<halt>[-\d.eE]+)\s+"
+    r"lprm\s+(?P<lprm>[-\d.eE]+)\s+"
+    r"r\s+(?P<r>[-\d.eE]+)\s+"
+    r"acc_p\s+(?P<acc>[-\d.eE]+)\s+"
+    r"acc_q\s+(?P<acc_q>[-\d.eE]+)\s+"
     r"gn\s+(?P<gn>[-\d.eE]+)"
 )
 _EVAL_LINE = re.compile(
@@ -70,12 +83,16 @@ def parse_log(path: Path):
     last_step = 0
     with path.open() as f:
         for line in f:
-            m = _LOG_LINE.search(line)
+            m = _LOG_LINE_NEW.search(line) or _LOG_LINE_OLD.search(line)
             if m:
                 step = int(m["step"])
                 last_step = step
                 for key in ("loss", "recon", "kl", "halt", "lprm", "r", "acc", "gn"):
                     train[key].append((step, float(m[key])))
+                if "recon_q" in m.groupdict() and m["recon_q"] is not None:
+                    train["recon_q"].append((step, float(m["recon_q"])))
+                if "acc_q" in m.groupdict() and m["acc_q"] is not None:
+                    train["acc_q"].append((step, float(m["acc_q"])))
                 continue
             e = _EVAL_LINE.search(line)
             if e:

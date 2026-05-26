@@ -3,9 +3,9 @@
 After 100 random training steps, assert that the three bugs we caught in
 the long training run cannot recur silently:
 
-  1. puzzle_embed.abs().mean() > 1
-     If the puzzle embedding init is back at ~0.02, the halt/value heads
-     read near-zero noise and this fails.
+  1. puzzle embeddings and post-scaled content embeddings start on the same
+     order of magnitude. If one stream dominates, posterior/prior diagnostics
+     become misleading before training even starts.
 
   2. sigma_p.std() > 0.005
      If the prior's log-variance head has died (output stuck at zero so
@@ -69,14 +69,15 @@ def main():
     )
     model = GRAM(cfg)
 
-    # --- check 1 (init time): puzzle embed scale ---
+    # --- check 1 (init time): puzzle/content scale match ---
     init_pe = model.puzzle_embed.abs().mean().item()
     init_content = (model.token_embed.weight * (cfg.d_model ** 0.5)).abs().mean().item()
     print(f"puzzle_embed init  abs_mean = {init_pe:.3f}")
     print(f"content   token  abs_mean (after sqrt(D) scaling) = {init_content:.3f}")
-    assert init_pe > 1.0, (
-        f"Puzzle embed magnitude {init_pe:.4f} is too small (need > 1). "
-        "Halt/value heads will see near-zero input."
+    ratio = init_pe / max(init_content, 1e-8)
+    assert 0.3 <= ratio <= 3.0, (
+        f"Puzzle/content magnitude ratio {ratio:.3f} is out of range. "
+        "The register tokens and content tokens should start at comparable scale."
     )
 
     # --- run a few steps and inspect variational stats ---

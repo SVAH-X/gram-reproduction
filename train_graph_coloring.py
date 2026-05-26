@@ -46,6 +46,33 @@ def _nullcontext():
     yield
 
 
+def adamw_param_groups(model, weight_decay: float):
+    """Apply weight decay only to matrix weights.
+
+    With wd=1.0, decaying embeddings, norm scales, biases, and learned register
+    tokens over 80K steps drives their magnitudes toward zero and matches the
+    mp/mq collapse seen in the failed logs.
+    """
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (
+            param.ndim < 2
+            or name.endswith(".bias")
+            or "embed" in name
+            or "norm" in name
+        ):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
 def paper_beta(n: int) -> float:
     if n == 8:
         return 0.5
@@ -98,6 +125,7 @@ def main():
     ap.add_argument("--cache-dir", type=str, default=None, help="Optional generator cache for custom sweeps; default is disabled.")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--wd", type=float, default=1.0)
+    ap.add_argument("--decay-all", action="store_true", help="Apply AdamW weight decay to every parameter. Default excludes embeddings/norms/biases/registers.")
     ap.add_argument("--beta", type=float, default=None)
     ap.add_argument("--kl-balance", type=float, default=0.8)
     ap.add_argument("--ema-decay", type=float, default=0.9999)
@@ -173,7 +201,8 @@ def main():
     )
     model = GRAM(cfg).to(device)
     ema = EMA(model, decay=args.ema_decay)
-    opt = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    opt_params = model.parameters() if args.decay_all else adamw_param_groups(model, args.wd)
+    opt = AdamW(opt_params, lr=args.lr, weight_decay=args.wd if args.decay_all else 0.0)
     planned_steps = args.epochs * cfg.N_sup
     total_steps = min(planned_steps, args.max_steps) if args.max_steps else planned_steps
 
@@ -194,6 +223,7 @@ def main():
     print(f"planned training steps    : {planned_steps}")
     print(f"running training steps    : {total_steps}")
     print(f"beta             : {args.beta}")
+    print(f"weight decay scope        : {'all params' if args.decay_all else 'matrix weights only'}")
 
     loader_gen = torch.Generator().manual_seed(args.seed)
     log_path = f"{out_prefix}.log"

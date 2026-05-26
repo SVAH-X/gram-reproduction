@@ -22,6 +22,9 @@ from torch.utils.data import DataLoader
 
 from gram_model import EMA, GRAM, GRAMConfig
 from data_nqueens import (
+    EMPTY,
+    PAD,
+    QUEEN,
     VOCAB_SIZE,
     NQueensEvalSet,
     NQueensTrainDataset,
@@ -36,6 +39,33 @@ from data_nqueens import (
 @contextmanager
 def _nullcontext():
     yield
+
+
+def adamw_param_groups(model, weight_decay: float):
+    """Apply the paper weight decay to matrix weights, not scales/registers.
+
+    AdamW wd=1.0 over tens of thousands of steps collapses embeddings, norm
+    scales, biases, and learned register tokens when applied indiscriminately.
+    Standard Transformer training excludes those parameters from decay.
+    """
+    decay = []
+    no_decay = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if (
+            param.ndim < 2
+            or name.endswith(".bias")
+            or "embed" in name
+            or "norm" in name
+        ):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 
 
 def paper_epochs(n: int) -> int:
@@ -61,6 +91,9 @@ def evaluate(model, eval_set, batch_size, device, samples=20, max_examples=None,
     total = 0
     acc_sum = 0.0
     cov_sum = 0.0
+    queen_sum = 0.0
+    keep_sum = 0.0
+    given_sum = 0.0
     with ctx:
         for x, completions in eval_set.batches(batch_size, max_examples=max_examples):
             x = x.to(device)
@@ -68,6 +101,9 @@ def evaluate(model, eval_set, batch_size, device, samples=20, max_examples=None,
             pred = logits.argmax(-1)
             bsz = x.shape[0]
             acc_sum += nqueens_accuracy(pred, x, eval_set.n) * bsz
+            queen_sum += (pred == QUEEN).sum().item()
+            keep_sum += ((x == QUEEN) & (pred == QUEEN)).sum().item()
+            given_sum += (x == QUEEN).sum().item()
 
             preds = []
             for _ in range(samples):
@@ -78,6 +114,8 @@ def evaluate(model, eval_set, batch_size, device, samples=20, max_examples=None,
     return {
         "accuracy": acc_sum / max(total, 1),
         "coverage": cov_sum / max(total, 1),
+        "avg_queens": queen_sum / max(total, 1),
+        "given_keep": keep_sum / max(given_sum, 1),
         "n_eval": total,
     }
 
@@ -91,6 +129,8 @@ def main():
     ap.add_argument("--b-per-step", type=int, default=64, help="Microbatch size for gradient accumulation.")
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--wd", type=float, default=1.0)
+    ap.add_argument("--decay-all", action="store_true", help="Apply AdamW weight decay to every parameter. Default excludes embeddings/norms/biases/registers.")
+    ap.add_argument("--queen-loss-weight", type=str, default="auto", help="'auto' uses N-1; set a float to override; set 1 for unweighted CE.")
     ap.add_argument("--beta", type=float, default=None)
     ap.add_argument("--kl-balance", type=float, default=0.8)
     ap.add_argument("--ema-decay", type=float, default=0.9999)
@@ -113,6 +153,10 @@ def main():
 
     args.epochs = args.epochs if args.epochs is not None else paper_epochs(args.n)
     args.beta = args.beta if args.beta is not None else paper_beta(args.n)
+    if args.queen_loss_weight == "auto":
+        queen_loss_weight = float(args.n - 1)
+    else:
+        queen_loss_weight = float(args.queen_loss_weight)
     if args.global_batch % args.b_per_step != 0:
         raise ValueError("--global-batch must be divisible by --b-per-step.")
 
@@ -154,7 +198,12 @@ def main():
     )
     model = GRAM(cfg).to(device)
     ema = EMA(model, decay=args.ema_decay)
-    opt = AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    opt_params = model.parameters() if args.decay_all else adamw_param_groups(model, args.wd)
+    opt = AdamW(opt_params, lr=args.lr, weight_decay=args.wd if args.decay_all else 0.0)
+    ce_weight = torch.ones(VOCAB_SIZE, dtype=torch.float32, device=device)
+    ce_weight[PAD] = 0.0
+    ce_weight[EMPTY] = 1.0
+    ce_weight[QUEEN] = queen_loss_weight
     planned_steps = args.epochs * cfg.N_sup
     total_steps = min(planned_steps, args.max_steps) if args.max_steps else planned_steps
 
@@ -174,6 +223,8 @@ def main():
     print(f"planned training steps    : {planned_steps}")
     print(f"running training steps    : {total_steps}")
     print(f"beta                      : {args.beta}")
+    print(f"queen loss weight         : {queen_loss_weight:g}")
+    print(f"weight decay scope        : {'all params' if args.decay_all else 'matrix weights only'}")
 
     loader_gen = torch.Generator().manual_seed(args.seed)
     log_path = f"{out_prefix}.log"
@@ -239,6 +290,7 @@ def main():
                             kl_balance=args.kl_balance,
                             lprm_weight=args.lprm_weight,
                             halt_weight=args.halt_weight,
+                            ce_weight=ce_weight,
                         )
                     (loss * weight).backward()
                     next_states.append((h_next, l_next))
@@ -282,7 +334,8 @@ def main():
                         )
                         line = (
                             f"  >> {tag:3s} test n={ev['n_eval']} "
-                            f"acc {ev['accuracy']:.4f} coverage@{args.coverage_samples} {ev['coverage']:.4f}"
+                            f"acc {ev['accuracy']:.4f} coverage@{args.coverage_samples} {ev['coverage']:.4f} "
+                            f"avg_q {ev['avg_queens']:.2f}/{args.n} keep {ev['given_keep']:.3f}"
                         )
                         print(line)
                         logf.write(line + "\n")

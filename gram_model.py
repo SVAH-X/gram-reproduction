@@ -5,11 +5,11 @@ Paper: Baek, Jo, Kim, Ren, Bengio, Ahn — "Generative Recursive Reasoning"
 
 Per supervision step s in 0..N_sup-1:
     - K inner f_L iterations followed by f_H proposal -> u_t
-    - eps ~ q_phi(eps | u, e_y)        (training)  or  p_theta(eps | u)   (eval)
-    - h_t = u_t + eps
-    - decode logits = lm_head(norm_out(h_t))
-    - cross-entropy reconstruction + balanced KL(q || p)
-    - halt_logit_t = q_head(h_t)         BCE against per-example correctness
+    - eps_p ~ p_theta(eps | u), eps_q ~ q_phi(eps | u, e_y)
+    - decode both h_p = u_t + eps_p and h_q = u_t + eps_q during training
+    - cross-entropy reconstruction on the prior path, auxiliary posterior CE,
+      and balanced KL(q || p)
+    - halt_logit_t = q_head(h_p)         BCE against per-example correctness
 
 Final hidden h_T feeds value_head (LPRM) for best-of-N selection at inference.
 """
@@ -307,16 +307,16 @@ class GRAM(nn.Module):
         state_seq_len = cfg.state_seq_len
 
         self.token_embed = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        # We multiply token embeddings by sqrt(D) in encode(), following the
+        # paper. Initialize them at 1/sqrt(D) so the post-scaled stream has
+        # unit scale. PyTorch's default Embedding init is N(0, 1), which would
+        # become std ~= sqrt(D) after scaling and saturate the posterior head.
+        nn.init.normal_(self.token_embed.weight, mean=0.0, std=1.0 / math.sqrt(cfg.d_model))
         # Paper B.1: 16 prepended puzzle/register tokens, shared across the
         # batch and learned. The halt and value heads read position 0.
-        # Init at the post-scaling magnitude of content tokens. Content tokens
-        # use the default nn.Embedding init N(0, 1) which we then scale by
-        # sqrt(D) in `encode`, so their per-element std is sqrt(D). Initing
-        # puzzle_embed at N(0, sqrt(D)²) keeps both streams on the same scale.
-        # The previous N(0, 0.02²) init left puzzle tokens ~1000× too small
-        # and the halt/value heads (which read h[:, 0]) saw near-zero input.
+        # Init at the same post-scaling magnitude as content tokens.
         self.puzzle_embed = nn.Parameter(
-            torch.randn(1, cfg.num_puzzle_tokens, cfg.d_model) * math.sqrt(cfg.d_model)
+            torch.randn(1, cfg.num_puzzle_tokens, cfg.d_model)
         )
         # learned pos embed only used when RoPE is off
         if not cfg.use_rope:
@@ -422,7 +422,8 @@ class GRAM(nn.Module):
                                   kl_balance: float = 0.8,
                                   lprm_weight: float = 1.0,
                                   halt_weight: float = 0.5,
-                                  y_mask: Optional[torch.Tensor] = None):
+                                  y_mask: Optional[torch.Tensor] = None,
+                                  ce_weight: Optional[torch.Tensor] = None):
         """Train exactly one deep-supervision segment.
 
         This is the paper-aligned update unit: each segment runs T transitions,
@@ -450,17 +451,16 @@ class GRAM(nn.Module):
         logits_q = self.decode(h_q)
 
         def _ce(logits):
-            if y_mask is None:
-                return F.cross_entropy(
-                    logits.reshape(-1, self.cfg.vocab_size),
-                    y_ids.reshape(-1),
-                )
-            y_for_loss = y_ids.masked_fill(~y_mask, -100)
-            return F.cross_entropy(
-                logits.reshape(-1, self.cfg.vocab_size),
-                y_for_loss.reshape(-1),
-                ignore_index=-100,
-            )
+            logp = F.log_softmax(logits, dim=-1)
+            targets = y_ids.clamp_min(0)
+            nll = -logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+            valid = torch.ones_like(y_ids, dtype=nll.dtype)
+            if y_mask is not None:
+                valid = valid * y_mask.to(nll.dtype)
+            if ce_weight is not None:
+                token_w = ce_weight.to(device=logits.device, dtype=nll.dtype)
+                valid = valid * token_w[targets]
+            return (nll * valid).sum() / valid.sum().clamp_min(1.0)
 
         recon_p = _ce(logits_p)
         recon_q = _ce(logits_q)
