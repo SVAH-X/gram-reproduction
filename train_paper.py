@@ -27,6 +27,7 @@ from data_nqueens import (
     QUEEN,
     VOCAB_SIZE,
     NQueensEvalSet,
+    NQueensRandomTargetDataset,
     NQueensTrainDataset,
     build_nqueens,
     load_nqueens_cache,
@@ -141,6 +142,7 @@ def main():
     ap.add_argument("--wd", type=float, default=1.0)
     ap.add_argument("--decay-all", action="store_true", help="Apply AdamW weight decay to every parameter. Default excludes embeddings/norms/biases/registers.")
     ap.add_argument("--queen-loss-weight", type=str, default="1.0", help="Paper-faithful default is 1.0. 'auto' uses N-1 as an explicit ablation.")
+    ap.add_argument("--nq-target-sampling", choices=["pairs", "random"], default="pairs", help="'pairs' materializes all (input,target) pairs; 'random' samples one completion per unique input per access.")
     ap.add_argument("--beta", type=float, default=None)
     ap.add_argument("--kl-balance", type=float, default=0.8)
     ap.add_argument("--kl-reduction", choices=["mean", "sum", "sum_d_mean_l"], default="mean", help="How to reduce elementwise KL before applying beta.")
@@ -159,6 +161,8 @@ def main():
     ap.add_argument("--eval-every", type=int, default=1000)
     ap.add_argument("--eval-batch", type=int, default=128)
     ap.add_argument("--eval-max", type=int, default=512, help="Use 0 for the full test set during periodic eval.")
+    ap.add_argument("--eval-train", action="store_true", help="Also run full-prior eval on a train-set slice at each eval interval.")
+    ap.add_argument("--eval-train-max", type=int, default=512, help="Train examples for --eval-train; use 0 for full train split.")
     ap.add_argument("--coverage-samples", type=int, default=20)
     ap.add_argument("--ckpt-every", type=int, default=5000)
     ap.add_argument("--out-prefix", type=str, default=None)
@@ -193,8 +197,12 @@ def main():
         build = build_nqueens(args.n, seed=args.seed)
         data_source = "generated in memory"
 
-    train_ds = NQueensTrainDataset(build)
+    if args.nq_target_sampling == "random":
+        train_ds = NQueensRandomTargetDataset(build, seed=args.seed)
+    else:
+        train_ds = NQueensTrainDataset(build)
     test_eval = NQueensEvalSet(build, split="test")
+    train_eval = NQueensEvalSet(build, split="train")
     dataset_batches_per_pass = steps_per_epoch(len(train_ds), args.global_batch)
 
     cfg = GRAMConfig(
@@ -237,6 +245,7 @@ def main():
     print(f"raw generated pairs       : {build.raw_pairs}")
     print(f"unique train/test inputs  : {len(build.train_inputs)} / {len(build.test_inputs)}")
     print(f"train/test target pairs   : {build.train_pairs} / {build.test_pairs}")
+    print(f"target sampling           : {args.nq_target_sampling}")
     print(f"global batch              : {args.global_batch} ({args.b_per_step} microbatch)")
     print(f"dataset batches/pass      : {dataset_batches_per_pass}")
     print(f"paper trajectory batches  : {args.epochs}")
@@ -350,6 +359,17 @@ def main():
 
                 if args.eval_every and global_step % args.eval_every == 0:
                     eval_max = None if args.eval_max == 0 else args.eval_max
+                    def _emit_eval(split_name, tag, ev):
+                        line = (
+                            f"  >> {tag:3s} {split_name} n={ev['n_eval']} "
+                            f"acc {ev['accuracy']:.4f} coverage@{args.coverage_samples} {ev['coverage']:.4f} "
+                            f"avg_q {ev['avg_queens']:.2f}/{args.n} keep {ev['given_keep']:.3f} "
+                            f"exact{args.n} {ev['exact_n']:.3f} row {ev['rows_ok']:.3f} "
+                            f"col {ev['cols_ok']:.3f} diag {ev['diag_ok']:.3f}"
+                        )
+                        print(line)
+                        logf.write(line + "\n")
+
                     for tag, use_ema in (("raw", False), ("EMA", True)):
                         ev = evaluate(
                             model,
@@ -361,15 +381,20 @@ def main():
                             use_ema=use_ema,
                             ema=ema,
                         )
-                        line = (
-                            f"  >> {tag:3s} test n={ev['n_eval']} "
-                            f"acc {ev['accuracy']:.4f} coverage@{args.coverage_samples} {ev['coverage']:.4f} "
-                            f"avg_q {ev['avg_queens']:.2f}/{args.n} keep {ev['given_keep']:.3f} "
-                            f"exact{args.n} {ev['exact_n']:.3f} row {ev['rows_ok']:.3f} "
-                            f"col {ev['cols_ok']:.3f} diag {ev['diag_ok']:.3f}"
+                        _emit_eval("test", tag, ev)
+                    if args.eval_train:
+                        train_eval_max = None if args.eval_train_max == 0 else args.eval_train_max
+                        ev = evaluate(
+                            model,
+                            train_eval,
+                            args.eval_batch,
+                            device,
+                            samples=args.coverage_samples,
+                            max_examples=train_eval_max,
+                            use_ema=False,
+                            ema=ema,
                         )
-                        print(line)
-                        logf.write(line + "\n")
+                        _emit_eval("train", "raw", ev)
                     logf.flush()
 
                 if args.ckpt_every and global_step % args.ckpt_every == 0:

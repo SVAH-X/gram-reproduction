@@ -187,6 +187,29 @@ class NQueensTrainDataset(Dataset):
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
+class NQueensRandomTargetDataset(Dataset):
+    """One item per unique input; sample one valid completion per access.
+
+    This matches the Graph Coloring loader's multi-solution sampling style and
+    avoids weighting an input in proportion to its number of completions.
+    """
+
+    def __init__(self, build: NQueensBuild, seed: int = 0):
+        self.n = build.n
+        self.inputs = build.train_inputs
+        self.completions = build.completions
+        self.rng = random.Random(seed)
+
+    def __len__(self) -> int:
+        return len(self.inputs)
+
+    def __getitem__(self, idx: int):
+        x = self.inputs[idx]
+        targets = self.completions[x]
+        y = targets[self.rng.randrange(len(targets))]
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+
 class NQueensEvalSet:
     """Unique-input evaluation set with all valid completions per input."""
 

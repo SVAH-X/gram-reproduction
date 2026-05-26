@@ -70,6 +70,7 @@ Paper-stated knobs and controlled ablations already wired in:
 - **β (KL weight) per task**: 0.07 / 0.045 / 0.5 / 0.45 for NQ-8 / NQ-10 / GC-8 / GC-10 (auto-selected, override with `--beta`).
 - **Posterior rollout for training**: segment trajectories sample from `q(eps | u, y)`; the reconstruction loss is on the posterior terminal state, while the prior learns through balanced KL. `acc_p_on_q_state` is only a local diagnostic from a posterior-conditioned proposal state; the `>> raw/EMA test` lines are the true full-prior rollout metrics.
 - **N-Queens CE weighting**: defaults to paper-faithful unweighted CE (`--queen-loss-weight 1.0`). Use `--queen-loss-weight auto` only as an explicit imbalance ablation.
+- **N-Queens multi-solution sampling**: defaults to materialized `(input,target)` pairs. Use `--nq-target-sampling random` to sample one valid completion per unique input per access, matching the Graph Coloring loader style.
 - **KL reduction ablation**: `--kl-reduction mean` by default; `sum` and `sum_d_mean_l` are available because the paper does not specify the reduction axes. Logs include both `km` (per-element mean KL) and `ks` (sum over latent axes) for scale diagnostics.
 - **Puzzle/register-token ablation**: task scripts default to `--num-puzzle-tokens 0`; pass `--num-puzzle-tokens 16` to test the Appendix-B.1/register-token reading.
 - **Optional Dreamer-style safeguards**: `--free-nats`, `--sigma-floor`, and `--mu-scale` are off by default and exposed as ablations.
